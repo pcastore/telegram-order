@@ -1,0 +1,26 @@
+name = "telegram-order"
+main = "telegram-worker.js"
+compatibility_date = "2025-01-01"
+keep_vars = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+HIGH_VALUE_ALERT_MMK = "1000000"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pca-images"
+database_id = "d6c6077e-8dbc-4f50-857b-d91e43e8f491"
+
+# pcastore worker ကို တိုက်ရိုက်ခေါ်ဖို့ (workers.dev error 1042 မဖြစ်အောင်)
+[[services]]
+binding = "AUTH_WORKER"
+service = "pcastore"
+
+[placement]
+mode = "smart"
+
+[observability]
+enabled = true
