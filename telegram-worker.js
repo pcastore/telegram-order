@@ -913,6 +913,92 @@ const COST_DETAIL_CHUNK = 40;     // games per costUpdates/{cycle}_{k} doc (keep
 const COST_BUTTONS_PER_MSG = 60;  // game buttons per index message (Telegram allows 100)
 const COST_MAX_ROWS = 200;        // safety cap on queued game tables (they now wait in settings/costCycle until the cycle ends; keeps that doc under 1 MB)
 
+// ---------------------------------------------------------------------------
+// Worker-side error log + health check (the /health command and the "Worker Check" / "Errors" buttons)
+// ---------------------------------------------------------------------------
+// Errors are collected in memory during a tick (noteWorkerError) and written ONCE to settings/workerHealth
+// (flushWorkerErrors) - last 20 lines, the same message is not repeated within 10 minutes.
+const HEALTH_DOC = 'settings/workerHealth';
+const COST_NOTICE_TTL_MS = 30 * 60 * 1000; // a "Cost Update starting" notice that never reached a result is forgotten after this
+let _errBuf = [];
+function noteWorkerError(area, msg) {
+  _errBuf.push({ at: new Date().toISOString(), area: String(area), msg: String(msg || '').replace(/\|/g, '/').slice(0, 160) });
+  if (_errBuf.length > 10) _errBuf.shift();
+}
+async function flushWorkerErrors(env) {
+  if (!_errBuf.length) return;
+  const pending = _errBuf; _errBuf = [];
+  try {
+    const doc = await getDoc(env, HEALTH_DOC);
+    const old = doc && Array.isArray(doc.fields.errors) ? doc.fields.errors.map(String) : [];
+    const lines = old.slice();
+    for (const e of pending) {
+      const last = lines.length ? lines[lines.length - 1].split('|') : null;
+      if (last && last[1] === e.area && last.slice(2).join('|') === e.msg && Date.now() - Date.parse(last[0]) < 10 * 60 * 1000) continue;
+      lines.push(`${e.at}|${e.area}|${e.msg}`);
+    }
+    const keep = lines.slice(-20);
+    if (keep.length !== old.length || keep[keep.length - 1] !== old[old.length - 1]) await patchDoc(env, HEALTH_DOC, { errors: keep }, ['errors']);
+  } catch (e) { console.error('flushWorkerErrors failed', e); }
+}
+function yangonStamp(iso) {
+  const ms = Date.parse(iso);
+  if (!ms) return '-';
+  return new Date(ms).toLocaleString('en-GB', { timeZone: 'Asia/Yangon', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+const COST_KIND_LABEL = { g2bulk: 'G2Bulk', jcplays: 'JCPlays', voucher: 'G2Bulk Voucher', fazer: 'FazerCards' };
+const HEALTH_KB = { inline_keyboard: [[{ text: '🔄 Re-check', callback_data: 'health:run' }, { text: '⚠️ Errors', callback_data: 'health:errors' }]] };
+
+async function buildHealthReport(env, errorsOnly) {
+  let errDoc = null;
+  try { errDoc = await getDoc(env, HEALTH_DOC); } catch (e) { /* shown below */ }
+  const errs = errDoc && Array.isArray(errDoc.fields.errors) ? errDoc.fields.errors.map(String) : [];
+  const errBlock = errs.length
+    ? errs.slice(-8).reverse().map(l => { const p = l.split('|'); return `• ${yangonStamp(p[0])} [${esc(p[1] || '?')}] ${esc(p.slice(2).join('|'))}`; }).join('\n')
+    : '✅ No errors recorded';
+  if (errorsOnly) return `⚠️ <b>Recent Worker errors</b> (Yangon time)\n${errBlock}`;
+
+  const out = ['🩺 <b>Worker health</b>'];
+  const required = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'TELEGRAM_WEBHOOK_SECRET', 'FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY'];
+  const missing = required.filter(k => !env[k]);
+  out.push(missing.length ? `❌ Missing secrets: <code>${missing.join(', ')}</code>` : '✅ Secrets present');
+  if (!env.SWEEP_SECRET) out.push('ℹ️ SWEEP_SECRET not set (/run-sweep is off)');
+
+  // Firestore: real HTTP status, so a quota / permission problem is not mistaken for "doc missing".
+  let watch = {};
+  try {
+    const t0 = Date.now();
+    const token = await getAccessToken(env);
+    const r = await fetch(`${firestoreDocsBase(env)}/${COST_WATCH_DOC}`, { headers: { Authorization: `Bearer ${token}` } });
+    const ms = Date.now() - t0;
+    if (r.ok) { const d = await r.json(); watch = decodeFields(d.fields || {}); out.push(`✅ Firestore OK (${ms} ms)`); }
+    else if (r.status === 404) out.push(`✅ Firestore OK (${ms} ms) · cost watch not created yet`);
+    else out.push(`❌ Firestore HTTP ${r.status}${r.status === 429 ? ' (quota exceeded)' : ''}`);
+  } catch (e) { out.push('❌ Firestore auth: ' + esc(String(e.message || e)).slice(0, 140)); }
+
+  try {
+    const me = await tgApi(env, 'getMe', {});
+    out.push(me && me.ok ? `✅ Telegram bot OK (@${esc(me.result && me.result.username || '?')})` : '❌ Telegram getMe failed');
+  } catch (e) { out.push('❌ Telegram: ' + esc(String(e.message || e)).slice(0, 120)); }
+
+  try {
+    const cfg = buildCostCfg(await batchGetDocs(env, ['settings/g2bulk', 'settings/jcplays', 'settings/fazercard', 'settings/pricing']));
+    out.push(`🔌 Suppliers: G2Bulk ${cfg.g2bulkOff ? 'OFF' : 'on'} · JCPlays ${cfg.jcplaysOk ? 'ready' : 'not set'} · FazerCards ${cfg.fazerOk ? 'ready' : 'not set'}`);
+  } catch (e) { out.push('❌ Supplier settings: ' + esc(String(e.message || e)).slice(0, 100)); }
+
+  const nSrc = Array.isArray(watch.sources) ? watch.sources.length : 0;
+  const builtMin = watch.builtAt ? Math.round((Date.now() - Number(watch.builtAt)) / 60000) : null;
+  out.push(`💱 Cost watch: ${nSrc} catalogue(s)` + (builtMin !== null ? ` · list built ${builtMin} min ago` : ' · list not built yet') +
+    ` · retry ${Array.isArray(watch.retry) ? watch.retry.length : 0} · waiting rows ${Array.isArray(watch.rows) ? watch.rows.length : 0}`);
+  out.push('', '⚠️ <b>Recent errors</b>', errBlock);
+  return out.join('\n');
+}
+
+async function sendHealthReport(env, chatId, threadId, errorsOnly) {
+  const text = await buildHealthReport(env, errorsOnly);
+  await tgApi(env, 'sendMessage', { chat_id: chatId, message_thread_id: threadId, parse_mode: 'HTML', text, reply_markup: HEALTH_KB });
+}
+
 function makeSubrequestBudget(total) {
   let used = 0;
   return { spend(n = 1) { used += n; }, left() { return total - used; }, used() { return used; } };
@@ -1000,6 +1086,7 @@ async function fetchLiveCostMap(env, src, cfg, cache, budget) {
   if (cache.has(ck)) return cache.get(ck);
   budget.spend(1);
   let map = null;
+  let failWhy = 'no valid response';
   try {
     if (src.kind === 'g2bulk') {
       const res = await fetch(`https://api.g2bulk.com/v1/games/${encodeURIComponent(src.key)}/catalogue`);
@@ -1033,7 +1120,8 @@ async function fetchLiveCostMap(env, src, cfg, cache, budget) {
       const data = await res.json();
       if (data && data.ok && Array.isArray(data.offers)) map = new Map(data.offers.map(o => [String(o.offer_id), Math.round(Number(o.price_usd) * cfg.fazerRate)]));
     }
-  } catch (err) { console.error('Cost update - supplier fetch error', ck, err); }
+  } catch (err) { console.error('Cost update - supplier fetch error', ck, err); failWhy = String((err && err.message) || err); }
+  if (!map) noteWorkerError('cost', `supplier ${ck} unreadable: ${failWhy}`);
   cache.set(ck, map);
   return map;
 }
@@ -1291,7 +1379,8 @@ async function runAutoCostUpdateSweep(env) {
     rows: Array.isArray(prev.rows) ? prev.rows.slice() : [],
     rowsSince: prev.rowsSince || '',
     rowsPkgs: Number(prev.rowsPkgs) || 0,
-    rowsGames: Number(prev.rowsGames) || 0
+    rowsGames: Number(prev.rowsGames) || 0,
+    noticeAt: prev.noticeAt || ''
   };
   const dirty = new Set();
   const counters = { added: 0 };
@@ -1338,6 +1427,23 @@ async function runAutoCostUpdateSweep(env) {
     if (!map) continue;                                             // supplier unreachable - next pass
     const fp = costFingerprint(map);
     if (fp === src.fp) continue;                                    // nothing changed at the supplier
+    // Heads-up to the admin BEFORE the update runs: one Telegram message (with inline buttons) per burst of changes.
+    // src.fp empty = first look at this catalogue (just learning its prices), not a real supplier change - no notice.
+    if (src.fp && (!state.noticeAt || Date.now() - Date.parse(state.noticeAt) > COST_NOTICE_TTL_MS)) {
+      if (budget.left() < COST_RESERVE + 5) { retryNext.push(k); continue; }   // cannot afford the message this tick - try again next tick
+      budget.spend(1);
+      try {
+        const r = await tgApi(env, 'sendMessage', {
+          chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+          text: '💱 <b>Cost Update starting</b>\n' +
+            `Supplier: <b>${esc(COST_KIND_LABEL[src.kind] || src.kind)}</b> · ${src.g.length} game(s) use this catalogue\n` +
+            'Supplier ဘက် Cost ပြောင်းလဲမှု တွေ့လို့ Update စတင်ပါပြီ။ ပြီးရင် Game စာရင်း Message ပို့ပေးပါမယ်။',
+          reply_markup: HEALTH_KB
+        });
+        if (!(r && r.ok)) noteWorkerError('cost', 'heads-up message failed: ' + JSON.stringify(r).slice(0, 100));
+      } catch (e) { noteWorkerError('cost', 'heads-up message error: ' + (e && e.message)); }
+      state.noticeAt = new Date().toISOString(); dirty.add('noticeAt');
+    }
     const res = await applyCostChangeForSource(env, src, cfg, cache, budget, state, counters);
     if (res === 'ok') { src.fp = fp; dirty.add('sources'); }
     else if (res === 'defer') retryNext.push(k);
@@ -1355,12 +1461,14 @@ async function runAutoCostUpdateSweep(env) {
     if ((settled || state.rows.length >= COST_FLUSH_BATCH || Date.now() - since > COST_FLUSH_MAX_WAIT_MS) && budget.left() > 3) {
       try {
         if (await flushCostRows(env, state, budget)) {
-          state.rows = []; state.rowsSince = ''; state.rowsPkgs = 0; state.rowsGames = 0;
-          ['rows', 'rowsSince', 'rowsPkgs', 'rowsGames'].forEach(k => dirty.add(k));
+          state.rows = []; state.rowsSince = ''; state.rowsPkgs = 0; state.rowsGames = 0; state.noticeAt = '';
+          ['rows', 'rowsSince', 'rowsPkgs', 'rowsGames', 'noticeAt'].forEach(k => dirty.add(k));
         }
-      } catch (e) { console.error('Cost update announce failed:', e); }
+      } catch (e) { console.error('Cost update announce failed:', e); noteWorkerError('cost', 'announce failed: ' + (e && e.message)); }
     }
   }
+
+  if (_errBuf.length && budget.left() >= 3) { budget.spend(2); await flushWorkerErrors(env); }
 
   // ---- save only what changed ----
   if (dirty.size) {
@@ -1667,7 +1775,7 @@ async function runCronSweepBody(env) {
   } finally {
     // Runs even if an earlier step threw, so the 4-hourly Cost update can't be skipped by an unrelated failure.
     // It is last in the tick and only spends a small subrequest budget (see COST_TICK_BUDGET).
-    try { await runAutoCostUpdateSweep(env); } catch (e) { console.error('runAutoCostUpdateSweep error', e); }
+    try { await runAutoCostUpdateSweep(env); } catch (e) { console.error('runAutoCostUpdateSweep error', e); noteWorkerError('cost', 'sweep crashed: ' + (e && e.message)); await flushWorkerErrors(env); }
   }
 }
 
@@ -1681,6 +1789,7 @@ async function runCronSweepSteps(env) {
       await fulfillWalletOrders(env);
     } catch (e) {
       console.error('cron send steps failed', e); // don't let this block the polling steps below
+      noteWorkerError('cron', 'send steps failed: ' + (e && e.message));   // written to settings/workerHealth at the end of this tick
     } finally {
       await releaseSendLock(env);
     }
@@ -3397,6 +3506,11 @@ async function handleTelegramWebhook(request, env, ctx) {
       if (action === 'confirm') await resolveOrder(env, targetId, 'Processing', cb, '⏳ <b>MOVED TO PROCESSING</b>');
       else if (action === 'reject') await resolveOrder(env, targetId, 'Fail', cb, '❌ <b>REJECTED</b>');
       else if (action === 'cost') await showCostDetail(env, targetId, cb);
+      else if (action === 'health') {
+        await answerCallback(env, cb.id, 'Checking…');
+        const hm = cb.message || {};
+        await sendHealthReport(env, hm.chat && hm.chat.id ? hm.chat.id : env.TELEGRAM_CHAT_ID, hm.message_thread_id, targetId === 'errors');
+      }
       else if (action === 'wtopup_confirm') await resolveTopupConfirm(env, targetId, cb);
       else if (action === 'wtopup_reject') await resolveTopup(env, targetId, 'Rejected', cb, '❌ <b>REJECTED</b>');
       // The status button editResolvedMessage() leaves in place after
@@ -3418,6 +3532,17 @@ async function handleTelegramWebhook(request, env, ctx) {
   // handleTelegramLinkCommand).
   const msg = update.message;
   if (msg && msg.text) {
+    // /health (full check) and /errors (recent errors only) - admin chat / TELEGRAM_ADMIN_IDS only.
+    const hc = msg.text.trim().match(/^\/(health|errors)(?:@\w+)?$/i);
+    if (hc) {
+      try {
+        const allow = String(env.TELEGRAM_ADMIN_IDS || '').split(',').map(x => x.trim()).filter(Boolean);
+        const okActor = isAuthorizedTelegramActor(env, { message: msg, from: msg.from }) || (allow.length > 0 && msg.from && allow.includes(String(msg.from.id)));
+        if (!okActor) await tgApi(env, 'sendMessage', { chat_id: msg.chat.id, text: 'You are not allowed to do this.' });
+        else await sendHealthReport(env, msg.chat.id, msg.message_thread_id, hc[1].toLowerCase() === 'errors');
+      } catch (err) { console.error('health command error', err); }
+      return new Response('ok');
+    }
     try {
       await handleTelegramLinkCommand(env, msg);
     } catch (err) { console.error('telegram link command error', err); }
@@ -4072,7 +4197,7 @@ async function handleRegisterUser(request, env, ctx) {
 
   const uid = String(payload.sub);
   const sign = customerSignInKind(payload);
-  const respond = (c, created) => corsJson({ ok: true, userId: c.id, created, banned: !!c.fields.banned });
+  const respond = (c, created) => corsJson({ ok: true, userId: c.id, created, banned: !!c.fields.banned, name: wStr(c.fields.name) });
 
   const existing = await findExistingCustomer(env, payload, sign);
   if (existing) {
@@ -4089,37 +4214,52 @@ async function handleRegisterUser(request, env, ctx) {
   // One registration per sign-in at a time (double taps, two tabs).
   const claimPath = `registrationClaims/${uid}`;
   if (!(await createDocIfAbsent(env, claimPath, { at: new Date() }))) {
-    for (let i = 0; i < 4; i++) {
-      await new Promise(r => setTimeout(r, 500));
+    for (let i = 0; i < 8; i++) {
+      await new Promise(r => setTimeout(r, 700));
       const again = await findExistingCustomer(env, payload, sign);
       if (again) return respond(again, false);
     }
-    // Stale claim from an attempt that crashed half-way: take it over.
+    // Take the claim over ONLY when it is really stale (an attempt that crashed half-way).
+    // A claim younger than 30 s belongs to a request that is still running: answer "retry"
+    // instead of issuing a second ID to the same sign-in.
+    const claimDoc = await getDoc(env, claimPath);
+    const claimAge = claimDoc && claimDoc.fields.at ? Date.now() - new Date(claimDoc.fields.at).getTime() : Infinity;
+    if (claimAge < 30000) return corsJson({ ok: false, error: 'Your account is still being created, please try again.' }, 503);
     await patchDoc(env, claimPath, { at: new Date() }, ['at']);
   }
-
-  let id = null;
-  for (let i = 0; i < 6 && !id; i++) {
-    const candidate = makeCustomerId();
-    if (!(await getDoc(env, `users/${candidate}`))) id = candidate;
-  }
-  if (!id) return corsJson({ ok: false, error: 'Could not issue an ID, please try again.' }, 500);
 
   const email = wStr(payload.email).toLowerCase();
   const name = wStr(payload.name).slice(0, 60);
   const now = new Date();
-  const fields = {
-    guestId: id, authUid: uid, walletBalance: 0, createdAt: now, lastSeen: now,
-    name, phone: '', photo: wStr(payload.picture), registeredVia: sign.kind, registeredBy: 'worker'
+  const buildUserFields = (cid) => {
+    const f = {
+      guestId: cid, authUid: uid, walletBalance: 0, createdAt: now, lastSeen: now,
+      name, phone: '', photo: wStr(payload.picture), registeredVia: sign.kind, registeredBy: 'worker'
+    };
+    if (sign.kind === 'google' && email && payload.email_verified === true) f.googleEmail = email;
+    if (sign.kind === 'facebook' && email && payload.email_verified === true) f.facebookEmail = email;
+    if (sign.kind === 'telegram') f.telegramId = uid.slice(3);
+    return f;
   };
-  if (sign.kind === 'google' && email && payload.email_verified === true) fields.googleEmail = email;
-  if (sign.kind === 'facebook' && email && payload.email_verified === true) fields.facebookEmail = email;
-  if (sign.kind === 'telegram') fields.telegramId = uid.slice(3);
-  await patchDoc(env, `users/${id}`, fields, Object.keys(fields));
+
+  // Issue the ID AND create users/{id} in one atomic step (currentDocument.exists=false):
+  // two sign-ins can never end up sharing an ID, and a Firestore failure throws instead of
+  // returning an ID whose users doc was never written.
+  let id = null;
+  for (let i = 0; i < 6 && !id; i++) {
+    const candidate = makeCustomerId();
+    if (await createDocIfAbsent(env, `users/${candidate}`, buildUserFields(candidate))) id = candidate;
+  }
+  if (!id) return corsJson({ ok: false, error: 'Could not issue an ID, please try again.' }, 500);
 
   const link = { guestId: id, linkedAt: now };
   if (email) link.email = email;
-  await patchDoc(env, `${sign.coll}/${uid}`, link, Object.keys(link));
+  let linked = false;
+  for (let i = 0; i < 3 && !linked; i++) {
+    const lr = await patchDoc(env, `${sign.coll}/${uid}`, link, Object.keys(link));
+    if (lr && !lr.error) linked = true; else await new Promise(r => setTimeout(r, 300));
+  }
+  if (!linked) console.error('register-user: link doc write failed for', sign.coll, uid, '-> users/' + id);
 
   const tgUsername = sign.kind === 'telegram' ? wStr(payload.telegram_username || payload.username) : '';
   notifyNewCustomer(env, ctx, { id, name, label: sign.label, email, telegramId: sign.kind === 'telegram' ? uid.slice(3) : '', username: tgUsername });
@@ -4133,7 +4273,7 @@ async function handleRegisterUser(request, env, ctx) {
       }).catch(e => console.error('new-customer Telegram DM failed', e && e.message))
     );
   }
-  return corsJson({ ok: true, userId: id, created: true, banned: false });
+  return corsJson({ ok: true, userId: id, created: true, banned: false, name });
 }
 
 // ---------------------------------------------------------------------------
