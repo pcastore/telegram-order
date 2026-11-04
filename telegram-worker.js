@@ -139,8 +139,8 @@ function originList(fromEnv, fallback) {
 const STORE_ORIGINS = [
   'https://pcagamestoremm.vercel.app'
 ];
-const STORE_PATHS = new Set(['/ping', '/register-user', '/create-order', '/create-topup', '/update-profile', '/my-state']);
-const ADMIN_PATHS = new Set(['/admin-login-lookup', '/admin-sync-claims', '/cf-usage', '/firestore-usage', '/admin-backfill-google-email']);
+const STORE_PATHS = new Set(['/ping', '/register-user', '/create-order', '/create-topup', '/update-profile', '/my-state', '/create-package-link', '/payment-methods']);
+const ADMIN_PATHS = new Set(['/admin-login-lookup', '/admin-sync-claims', '/admin-sync-games', '/cf-usage', '/firestore-usage', '/admin-backfill-google-email']);
 
 function applyOriginCors(res, origin, allowed) {
   const headers = new Headers(res.headers);
@@ -194,6 +194,33 @@ async function routeRequest(request, env, ctx, url) {
           console.error(url.pathname + ' failed', err);
           return corsJson({ ok: false, error: 'Server error' }, 500);
         }
+      }
+    }
+
+    // Public catalogue mirror (gamesPublic) - admin panel calls this after every games edit.
+    if (url.pathname === '/admin-sync-games') {
+      if (request.method === 'OPTIONS') return corsPreflightAdmin();
+      if (request.method === 'POST') {
+        try { return await handleAdminSyncGames(request, env, url); }
+        catch (err) { console.error('/admin-sync-games failed', err); return corsJsonAdmin({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
+    // Payment accounts (number / QR): signed-in customers only, through the Worker.
+    if (url.pathname === '/payment-methods') {
+      if (request.method === 'OPTIONS') return corsPreflight();
+      if (request.method === 'POST') {
+        try { return await handlePaymentMethods(request, env); }
+        catch (err) { console.error('/payment-methods failed', err); return corsJson({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
+    // Shareable package link: the 8-digit code is issued HERE, never written by the browser.
+    if (url.pathname === '/create-package-link') {
+      if (request.method === 'OPTIONS') return corsPreflight();
+      if (request.method === 'POST') {
+        try { return await handleCreatePackageLink(request, env); }
+        catch (err) { console.error('/create-package-link failed', err); return corsJson({ ok: false, error: 'Server error' }, 500); }
       }
     }
 
@@ -1023,7 +1050,7 @@ async function updateGamePackagesMerged(env, gameId, mutate, opts = {}) {
       update: { name: docName(env, `games/${gameId}`), fields: { packages: encodeValue(packages) } },
       updateMask: { fieldPaths: ['packages'] },
       currentDocument: { updateTime: fresh.updateTime }
-    }]);
+    }, publicGameWrite(env, gameId, { ...fresh.fields, packages })]); // public mirror (no Cost) in the SAME atomic commit
     if (budget) budget.spend(1);
     if (!result.error) return ups;
     await new Promise(r => setTimeout(r, 150 + Math.random() * 250)); // admin saved in between - re-read and re-apply
@@ -2489,6 +2516,128 @@ async function getGamesCached(env, maxAgeMs = 30000) {
 
 const wStr = v => (v === null || v === undefined) ? '' : String(v);
 const wLower = v => wStr(v).trim().toLowerCase();
+
+// ---------------------------------------------------------------------------
+// Public catalogue mirror:  games/{id}  ->  gamesPublic/{id}
+// ---------------------------------------------------------------------------
+// The storefront must NOT read `games` (it holds Cost, margins and admin-only switches).
+// firestore.rules: `games` = admin-only read/write; `gamesPublic` = public read, NO client write.
+// This Worker is the only writer of gamesPublic:
+//   * admin.html -> POST /admin-sync-games {ids:[...]} | {all:true}   after any games edit
+//   * updateGamePackagesMerged() (cost cron) writes the mirror in the SAME atomic commit
+// Same array order as the source doc, so ?code= package links (pkgIndex) keep working.
+const PUBLIC_GAME_DROP = new Set(['autoUpdate', 'autoPriceMarginPct', 'charNameRequired', 'packageTabs']);
+const PUBLIC_GAME_DROP_RE = /(cost|margin|profit|supplier|secret|token|apikey|api_key|password|note)/i;
+const PUBLIC_PKG_DROP_RE = /^(cost|margin|profit|supplier|note|auto)/i;
+
+function toPublicGame(fields) {
+  const out = {};
+  for (const k of Object.keys(fields || {})) {
+    if (PUBLIC_GAME_DROP.has(k) || PUBLIC_GAME_DROP_RE.test(k)) continue;
+    if (k === 'packages') {
+      out.packages = (Array.isArray(fields.packages) ? fields.packages : []).map(p => {
+        if (!p || typeof p !== 'object') return p;
+        const q = {};
+        for (const pk of Object.keys(p)) if (!PUBLIC_PKG_DROP_RE.test(pk)) q[pk] = p[pk];
+        return q;
+      });
+      continue;
+    }
+    out[k] = fields[k];
+  }
+  return out;
+}
+function publicGameWrite(env, id, fields) {
+  const pub = toPublicGame(fields);
+  const enc = {};
+  for (const k of Object.keys(pub)) enc[k] = encodeValue(pub[k]);
+  // No updateMask = the whole mirror doc is replaced, so a field removed from games is removed here too.
+  return { update: { name: docName(env, `gamesPublic/${id}`), fields: enc } };
+}
+function publicGameDelete(env, id) { return { delete: docName(env, `gamesPublic/${id}`) }; }
+
+async function handleAdminSyncGames(request, env, url) {
+  // Admin sign-in with the admin claim is enough (no extra Firestore read); otherwise fall back to the listed-admin check.
+  let ok = false;
+  const m = /^Bearer\s+(.+)$/i.exec(request.headers.get('Authorization') || '');
+  if (m) { try { const pl = await verifyFirebaseIdToken(env, m[1]); ok = pl && pl.admin === true; } catch (e) { ok = false; } }
+  if (!ok) ok = !!(await authorizeAdminSync(request, env, url));
+  if (!ok) return corsJsonAdmin({ ok: false, error: 'forbidden' }, 403);
+
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const writes = [];
+  let written = 0, deleted = 0;
+
+  if (body && body.all === true) {
+    const [games, pubs] = await Promise.all([queryAllDocs(env, 'games'), queryAllDocs(env, 'gamesPublic')]);
+    if (!games.length && pubs.length) return corsJsonAdmin({ ok: false, error: 'games read returned nothing - mirror left untouched' }, 500);
+    const live = new Set(games.map(g => g.id));
+    games.forEach(g => { writes.push(publicGameWrite(env, g.id, g.fields)); written++; });
+    pubs.filter(p => !live.has(p.id)).forEach(p => { writes.push(publicGameDelete(env, p.id)); deleted++; });
+  } else {
+    const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map(String).filter(i => CLEAN_ID.test(i)))].slice(0, 400);
+    if (!ids.length) return corsJsonAdmin({ ok: true, written: 0, deleted: 0 });
+    const docs = await batchGetDocs(env, ids.map(id => `games/${id}`));
+    for (const id of ids) {
+      const gd = docs.get(`games/${id}`);
+      if (gd) { writes.push(publicGameWrite(env, id, gd.fields)); written++; }
+      else { writes.push(publicGameDelete(env, id)); deleted++; }
+    }
+  }
+  for (let i = 0; i < writes.length; i += 40) {
+    const r = await commitWrites(env, writes.slice(i, i + 40));
+    if (r && r.error) return corsJsonAdmin({ ok: false, error: 'mirror write failed' }, 500);
+  }
+  return corsJsonAdmin({ ok: true, written, deleted });
+}
+
+// POST { idToken } -> { ok, methods: { id: {...} } }. The paymentMethods collection is admin-only in
+// firestore.rules; a signed-in customer gets the list here (cached 30 s per isolate, so Firestore is read
+// at most twice a minute however many customers ask).
+let _pmCache = null;
+const PM_DROP_RE = /(secret|token|apikey|api_key|password)/i;
+async function handlePaymentMethods(request, env) {
+  let body;
+  try { body = await request.json(); } catch (e) { return badRequest('Bad request'); }
+  let payload;
+  try { payload = await verifyFirebaseIdToken(env, body && body.idToken); }
+  catch (e) { return badRequest('Please sign in again.', 401); }
+  if (!customerSignInKind(payload)) return badRequest('Please sign in with Google or Telegram.');
+  if (await rateLimitHit(env, 'paymentMethods', payload.sub, 40, 300)) return badRequest('Too many requests. Please try again in a few minutes.', 429);
+  if (!_pmCache || Date.now() - _pmCache.at > 30000) {
+    const docs = await queryAllDocs(env, 'paymentMethods');
+    const methods = {};
+    for (const d of docs) {
+      const o = {};
+      for (const k of Object.keys(d.fields)) if (!PM_DROP_RE.test(k)) o[k] = d.fields[k];
+      methods[d.id] = o;
+    }
+    _pmCache = { at: Date.now(), methods };
+  }
+  return corsJson({ ok: true, methods: _pmCache.methods });
+}
+
+// POST { gameId, pkgIndex } -> { ok, code }. The browser used to write packageLinks itself.
+async function handleCreatePackageLink(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (await rateLimitHit(env, 'pkgLink', ip, 20, 300, true)) return badRequest('Too many requests. Please try again in a few minutes.', 429);
+  let body;
+  try { body = await request.json(); } catch (e) { return badRequest('Bad request'); }
+  const gameId = wStr(body && body.gameId);
+  const idx = Number(body && body.pkgIndex);
+  if (!CLEAN_ID.test(gameId) || !Number.isInteger(idx) || idx < 0 || idx > 999) return badRequest('Bad request');
+  const g = await getDoc(env, `games/${gameId}`);
+  const pk = g && Array.isArray(g.fields.packages) ? g.fields.packages[idx] : null;
+  if (!pk || typeof pk !== 'object') return badRequest('Package not found.', 404);
+  for (let i = 0; i < 8; i++) {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const code = String(10000000 + (buf[0] % 90000000));
+    if (await createDocIfAbsent(env, `packageLinks/${code}`, { gameId, pkgIndex: idx, createdAt: new Date() })) return corsJson({ ok: true, code });
+  }
+  return badRequest('Could not create the link. Please try again.', 500);
+}
 
 // True when the customer's wallet has really been charged for this order (or,
 // for legacy orders, was charged up-front by the old browser code).
@@ -4487,8 +4636,7 @@ async function handleCreateOrder(request, env, ctx) {
   const price = Number(o.price);
   if (!Number.isInteger(price) || price < 0 || price > 50000000) return badRequest('Invalid price.');
   f.price = price;
-  const cost = Number(o.cost);
-  f.cost = Number.isFinite(cost) && cost >= 0 ? Math.round(cost) : 0;
+  f.cost = 0; // Cost is NEVER taken from the browser - it is set below from the games catalogue.
   // Quantity is only meaningful for G2Bulk voucher packages (one purchase call
   // buys N codes). Every other order is always exactly 1, whatever the browser says.
   const qty = parseInt(o.quantity, 10);
@@ -4516,6 +4664,15 @@ async function handleCreateOrder(request, env, ctx) {
   const idCheck = await verifyPlayerName(env, f, o);
   if (!idCheck.ok) return badRequest(idCheck.reason, idCheck.retry ? 503 : 400, 'ID_CHECK_FAILED');
   if (idCheck.name) f.inGameName = idCheck.name; // the checked name, straight from the provider
+  // Admin's "Requires Character Name" switch (games/{id}.charNameRequired): the name sent to the provider
+  // is the one the provider itself returned from the ID check - never a name typed in the browser.
+  if (f.playerId) {
+    const cg = (await getGamesCached(env)).find(x => wStr(x.fields.name) === wStr(f.game) && wStr(x.fields.serverName) === wStr(f.serverRegion));
+    if (cg && cg.fields.charNameRequired === true) {
+      if (!idCheck.name) return badRequest('Please check your In-Game ID first - the player name must appear before you can buy.', 400, 'ID_CHECK_FAILED');
+      f.charName = idCheck.name;
+    }
+  }
 
   // Too many orders already waiting? (spam / Telegram flooding)
   const pendingRes = await pendingP;
@@ -4544,11 +4701,14 @@ async function handleCreateOrder(request, env, ctx) {
       return badRequest('Could not verify your receipt right now. Please try again.', 503);
     }
 
-    // Receipt orders: the Worker re-derives the price from the games catalogue
-    // (same check wallet orders get in gateWalletOrder) BEFORE the order exists,
-    // so a tampered price never reaches Telegram / the admin queue. Cost is also
-    // taken from the catalogue, never from the browser.
-    const priced = await verifyWalletPrice(env, f, 0); // order placed now: compare against the live price, never a cached one
+  }
+
+  // Price + Cost are re-derived from the games catalogue for EVERY order (receipt AND wallet) BEFORE the
+  // order exists: a tampered price never reaches Telegram / the admin queue / the wallet sweep, and Cost
+  // always comes from the catalogue, never from the browser. (Wallet orders get the same check again,
+  // right before the provider call, in gateWalletOrder.)
+  {
+    const priced = await verifyWalletPrice(env, f, wallet ? 5000 : 0); // receipt: live price, never a cached one
     if (!priced.ok) return badRequest(priced.reason, 409, 'PRICE_CHANGED');
     f.price = priced.price;
     f.cost = priced.cost;
