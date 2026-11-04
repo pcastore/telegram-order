@@ -504,7 +504,24 @@ async function deleteFirestoreDoc(env, path) {
 // Firestore rules, same as every other Worker write in this file), but it
 // will grow forever unless you add a TTL policy: Firebase Console ->
 // Firestore -> TTL -> collection group "rateLimits" -> field "expiresAt".
+// WRITE-COST FIX: every rate-limit check was one Firestore WRITE (a counter doc under rateLimits/), and the store
+// polls /my-state every 5-60 s per customer - thousands of writes a day just for counting. These read-only /
+// high-frequency buckets are now counted in the Worker's own memory (per isolate: slightly looser, but nothing here
+// moves money). Order / top-up / login buckets still use the shared Firestore counter.
+const MEM_RATE_BUCKETS = new Set(['myState', 'paymentMethods', 'ping']);
+const _memRate = new Map(); // key -> { n, exp }
+function memRateHit(bucket, id, limit, windowSeconds) {
+  const now = Date.now();
+  const key = bucket + '|' + String(id || 'unknown').slice(0, 64) + '|' + Math.floor(now / (windowSeconds * 1000));
+  const e = _memRate.get(key);
+  if (e) { e.n++; return e.n > limit; }
+  _memRate.set(key, { n: 1, exp: now + windowSeconds * 2000 });
+  if (_memRate.size > 3000) for (const [k, v] of _memRate) if (v.exp < now) _memRate.delete(k);
+  return 1 > limit;
+}
+
 async function rateLimitHit(env, bucket, ip, limit, windowSeconds, failClosed = false) {
+  if (MEM_RATE_BUCKETS.has(bucket) && !failClosed) return memRateHit(bucket, ip, limit, windowSeconds);
   try {
     const windowId = Math.floor(Date.now() / (windowSeconds * 1000));
     const safeIp = String(ip || 'unknown').replace(/[^a-zA-Z0-9:.]/g, '_').slice(0, 64);
@@ -1052,7 +1069,10 @@ async function updateGamePackagesMerged(env, gameId, mutate, opts = {}) {
       currentDocument: { updateTime: fresh.updateTime }
     }, publicGameWrite(env, gameId, { ...fresh.fields, packages })]); // public mirror (no Cost) in the SAME atomic commit
     if (budget) budget.spend(1);
-    if (!result.error) return ups;
+    if (!result.error) {
+      try { await patchCatalog(env, new Map([[gameId, { ...fresh.fields, packages }]])); if (budget) budget.spend(2); } catch (e) { console.error('catalogue patch failed', e); }
+      return ups;
+    }
     await new Promise(r => setTimeout(r, 150 + Math.random() * 250)); // admin saved in between - re-read and re-apply
   }
   console.error('updateGamePackagesMerged: gave up after retries for game', gameId);
@@ -2556,6 +2576,63 @@ function publicGameWrite(env, id, fields) {
 }
 function publicGameDelete(env, id) { return { delete: docName(env, `gamesPublic/${id}`) }; }
 
+// ---------------------------------------------------------------------------
+// READ-COST FIX: single-fetch catalogue.  gamesPublic/{id} stays (older cached storefronts + fallback), but the
+// storefront now reads catalogPublic/cNN instead: the whole public catalogue packed into a few documents
+// (one JSON string field each, <= ~700 KB). A new visitor pays 1-2 reads instead of ~180.
+// ---------------------------------------------------------------------------
+const CATALOG_COLLECTION = 'catalogPublic';
+const CATALOG_MAX_BYTES = 700000;
+const _catEnc = new TextEncoder();
+const catChunkId = i => 'c' + String(i).padStart(2, '0');
+
+function packCatalog(map) { // Map(id -> public fields)  ->  array of JSON strings, one per chunk doc
+  const chunks = []; let cur = {}, n = 0, size = 2;
+  for (const id of [...map.keys()].sort()) {
+    const piece = JSON.stringify(map.get(id));
+    const b = _catEnc.encode(piece).length + id.length + 6;
+    if (n && size + b > CATALOG_MAX_BYTES) { chunks.push(cur); cur = {}; n = 0; size = 2; }
+    cur[id] = map.get(id); n++; size += b;
+  }
+  if (n || !chunks.length) chunks.push(cur);
+  return chunks.map(c => JSON.stringify(c));
+}
+async function loadCatalog(env) {
+  const docs = await queryAllDocs(env, CATALOG_COLLECTION);
+  const map = new Map();
+  for (const d of docs) {
+    try { const o = JSON.parse(d.fields.json || '{}'); for (const k of Object.keys(o)) map.set(k, o[k]); } catch (e) { /* skip a broken chunk */ }
+  }
+  return { map, docs };
+}
+async function writeCatalog(env, map, existingDocs) {
+  const jsons = packCatalog(map);
+  const old = new Map((existingDocs || []).map(d => [d.id, d.fields && d.fields.json]));
+  const writes = [];
+  jsons.forEach((j, i) => {
+    const id = catChunkId(i);
+    if (old.get(id) !== j) writes.push({ update: { name: docName(env, `${CATALOG_COLLECTION}/${id}`), fields: { json: { stringValue: j }, updatedAt: encodeValue(new Date()) } } });
+  });
+  const keep = new Set(jsons.map((_, i) => catChunkId(i)));
+  (existingDocs || []).forEach(d => { if (!keep.has(d.id)) writes.push({ delete: docName(env, `${CATALOG_COLLECTION}/${d.id}`) }); });
+  for (let i = 0; i < writes.length; i += 8) { // 8 x <=700 KB stays under the 10 MB commit limit
+    const r = await commitWrites(env, writes.slice(i, i + 8));
+    if (r && r.error) throw new Error('catalogue write failed');
+  }
+  return writes.length;
+}
+// changes: Map(gameId -> raw game fields | null to remove). Falls back to a full rebuild if the stored catalogue can't be read.
+async function patchCatalog(env, changes) {
+  let { map, docs } = await loadCatalog(env);
+  if (!map.size) {
+    const games = await queryAllDocs(env, 'games');
+    if (!games.length) return 0; // nothing trustworthy to publish
+    map = new Map(games.map(g => [g.id, toPublicGame(g.fields)]));
+  }
+  for (const [id, f] of changes) { if (f) map.set(id, toPublicGame(f)); else map.delete(id); }
+  return writeCatalog(env, map, docs);
+}
+
 async function handleAdminSyncGames(request, env, url) {
   // Admin sign-in with the admin claim is enough (no extra Firestore read); otherwise fall back to the listed-admin check.
   let ok = false;
@@ -2575,15 +2652,21 @@ async function handleAdminSyncGames(request, env, url) {
     const live = new Set(games.map(g => g.id));
     games.forEach(g => { writes.push(publicGameWrite(env, g.id, g.fields)); written++; });
     pubs.filter(p => !live.has(p.id)).forEach(p => { writes.push(publicGameDelete(env, p.id)); deleted++; });
+    if (games.length) {
+      try { const ex = await queryAllDocs(env, CATALOG_COLLECTION); await writeCatalog(env, new Map(games.map(g => [g.id, toPublicGame(g.fields)])), ex); }
+      catch (e) { console.error('catalogue rebuild failed', e); }
+    }
   } else {
     const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map(String).filter(i => CLEAN_ID.test(i)))].slice(0, 400);
     if (!ids.length) return corsJsonAdmin({ ok: true, written: 0, deleted: 0 });
     const docs = await batchGetDocs(env, ids.map(id => `games/${id}`));
+    const catChanges = new Map();
     for (const id of ids) {
       const gd = docs.get(`games/${id}`);
-      if (gd) { writes.push(publicGameWrite(env, id, gd.fields)); written++; }
-      else { writes.push(publicGameDelete(env, id)); deleted++; }
+      if (gd) { writes.push(publicGameWrite(env, id, gd.fields)); written++; catChanges.set(id, gd.fields); }
+      else { writes.push(publicGameDelete(env, id)); deleted++; catChanges.set(id, null); }
     }
+    try { await patchCatalog(env, catChanges); } catch (e) { console.error('catalogue patch failed', e); }
   }
   for (let i = 0; i < writes.length; i += 40) {
     const r = await commitWrites(env, writes.slice(i, i + 40));
@@ -4800,19 +4883,33 @@ function tsMs(v) { const t = v instanceof Date ? v.getTime() : new Date(v).getTi
 async function queryOwned(env, collectionId, userId, cap, parentPath) {
   const token = await getAccessToken(env);
   const base = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
-  const sq = parentPath
-    ? { from: [{ collectionId }], limit: cap }
-    : { from: [{ collectionId }], limit: 300, where: { fieldFilter: { field: { fieldPath: 'userId' }, op: 'EQUAL', value: { stringValue: String(userId) } } } };
-  const res = await fetch(`${base}${parentPath ? '/' + parentPath : ''}:runQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ structuredQuery: sq })
-  });
-  const rows = await res.json();
-  if (!res.ok || !Array.isArray(rows)) throw new Error('my-state query failed: ' + collectionId);
+  const eq = { fieldFilter: { field: { fieldPath: 'userId' }, op: 'EQUAL', value: { stringValue: String(userId) } } };
+  const run = async (sq) => {
+    const res = await fetch(`${base}${parentPath ? '/' + parentPath : ''}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ structuredQuery: sq })
+    });
+    const rows = await res.json();
+    return (res.ok && Array.isArray(rows)) ? rows : null;
+  };
+  let rows = null;
+  if (parentPath) {
+    rows = await run({ from: [{ collectionId }], limit: cap });
+  } else {
+    // READ-COST FIX: newest `cap` docs straight from Firestore (reads == docs returned). Needs the composite
+    // index userId + timestamp; if it is missing Firestore refuses the query (no reads billed) and we fall back
+    // to the old unordered read, with a log line carrying the "create index" link.
+    rows = await run({ from: [{ collectionId }], where: eq, orderBy: [{ field: { fieldPath: 'timestamp' }, direction: 'DESCENDING' }], limit: cap });
+    if (!rows) {
+      console.error('queryOwned: add composite index ' + collectionId + ' (userId ASC, timestamp DESC) to cut reads');
+      rows = await run({ from: [{ collectionId }], where: eq, limit: 300 });
+    }
+  }
+  if (!rows) throw new Error('my-state query failed: ' + collectionId);
   return rows.filter(r => r.document)
     .map(r => ({ id: r.document.name.split('/').pop(), ...publicFields(decodeFields(r.document.fields || {})) }))
-    .sort((a, b) => tsMs(b.timestamp) - tsMs(a.timestamp))   // newest first; sorted here so no composite index is needed
+    .sort((a, b) => tsMs(b.timestamp) - tsMs(a.timestamp))   // newest first
     .slice(0, cap);
 }
 
@@ -4847,9 +4944,30 @@ async function statsFor(env, customer) {
 // g2bulk_cache is public-read / admin-write in firestore.rules, so customers can't fill it. The Worker
 // (service account) does it from the 1-minute cron: each voucher category is refreshed about every 4 minutes
 // (spread across ticks so a tick never makes more than a few subrequests). Error bodies are never cached.
+// READ-COST FIX: this used to call getGamesCached() (30 s cache) from a 1-minute cron, so it re-read the WHOLE
+// games collection (~180 docs) on every tick = ~250,000 reads/day. The category list almost never changes, so it is
+// now kept in settings/g2bulkCats and rebuilt from `games` at most once per CATS_REFRESH_MS (1 read per tick, 0 when warm).
+const CATS_REFRESH_MS = 30 * 60 * 1000;
+let _catIdsMemo = null;
+async function getG2BulkCategoryIds(env) {
+  if (_catIdsMemo && Date.now() - _catIdsMemo.at < CATS_REFRESH_MS) return _catIdsMemo.ids;
+  let ids = null, at = 0;
+  try {
+    const d = await getDoc(env, 'settings/g2bulkCats');
+    at = Number(d && d.fields && d.fields.at) || 0;
+    if (d && d.fields && Array.isArray(d.fields.ids) && Date.now() - at < CATS_REFRESH_MS) ids = d.fields.ids.map(String);
+  } catch (e) { /* fall through to rebuild */ }
+  if (!ids) {
+    const games = await queryAllDocs(env, 'games');
+    ids = [...new Set(games.map(g => g.fields && g.fields.g2bulkVoucherCategory).filter(Boolean).map(String))];
+    try { await patchDoc(env, 'settings/g2bulkCats', { ids, at: Date.now() }, ['ids', 'at']); } catch (e) { console.error('g2bulkCats save failed', e); }
+    at = Date.now();
+  }
+  _catIdsMemo = { at, ids };
+  return ids;
+}
 async function refreshG2BulkCache(env) {
-  const games = await getGamesCached(env);
-  const ids = [...new Set(games.map(g => g.fields && g.fields.g2bulkVoucherCategory).filter(Boolean).map(String))];
+  const ids = await getG2BulkCategoryIds(env);
   const slot = Math.floor(Date.now() / 60000);
   for (let i = 0; i < ids.length; i++) {
     if ((slot + i) % 4 !== 0) continue;
@@ -4909,6 +5027,20 @@ async function ordersToday(env, userId, range) {
   return [...map.values()].sort((a, b) => tsMs(b.timestamp) - tsMs(a.timestamp)).slice(0, 200);
 }
 
+// READ-COST FIX: the storefront polls /my-state every 5-60 s per signed-in customer and every poll re-read the
+// customer's top-ups (up to 300 docs) and inbox (50 docs). Those change rarely, so they are cached per customer
+// for a short time (orders + the user doc stay live). A new top-up clears its own entry straight away.
+const _msPartCache = new Map(); // "topups:<id>" | "inbox:<id>" -> { at, data }
+const MS_TOPUP_TTL = 30000, MS_INBOX_TTL = 60000;
+async function msCached(key, ttl, fn) {
+  const c = _msPartCache.get(key);
+  if (c && Date.now() - c.at < ttl) return c.data;
+  const data = await fn();
+  _msPartCache.set(key, { at: Date.now(), data });
+  if (_msPartCache.size > 400) { const now = Date.now(); for (const [k, v] of _msPartCache) if (now - v.at > 120000) _msPartCache.delete(k); }
+  return data;
+}
+
 async function handleMyState(request, env) {
   const auth = await authCustomerRequest(request, env, 'myState', 60, 60);
   if (auth.error) return auth.error;
@@ -4918,8 +5050,8 @@ async function handleMyState(request, env) {
     const range = dayRangeIso(body.day, body.tzMin);
     const [orders, topups, inbox, stats, dayOrders] = await Promise.all([
       want.has('orders') ? (range ? ordersToday(env, customer.id, range) : queryOwned(env, 'orders', customer.id, 100)) : null,
-      want.has('topups') ? queryOwned(env, 'walletTopups', customer.id, 50) : null,
-      want.has('inbox') ? queryOwned(env, 'inbox', customer.id, 50, `users/${encodeURIComponent(customer.id)}`) : null,
+      want.has('topups') ? msCached('topups:' + customer.id, MS_TOPUP_TTL, () => queryOwned(env, 'walletTopups', customer.id, 50)) : null,
+      want.has('inbox') ? msCached('inbox:' + customer.id, MS_INBOX_TTL, () => queryOwned(env, 'inbox', customer.id, 50, `users/${encodeURIComponent(customer.id)}`)) : null,
       want.has('stats') ? statsFor(env, customer) : null,
       (want.has('dayOrders') && range) ? ordersForDay(env, customer.id, range).then(a => a.sort((x, y) => tsMs(y.timestamp) - tsMs(x.timestamp))) : null
     ]);
@@ -4960,6 +5092,7 @@ async function handleCreateTopup(request, env, ctx) {
     return badRequest('Could not verify your top-up right now. Please try again.', 503);
   }
 
+  _msPartCache.delete('topups:' + customer.id);
   const created = await createDoc(env, 'walletTopups', {
     amount, paymentMethod, receiptUrl,
     ...(topupTxId ? { transactionId: topupTxId } : {}),
@@ -4969,6 +5102,7 @@ async function handleCreateTopup(request, env, ctx) {
     userName: cleanStr(customer.fields.name, 60) || customer.id,
     userPhone: cleanStr(customer.fields.phone, 30)
   });
+  _msPartCache.delete('topups:' + customer.id); // again AFTER the write, so a poll that raced it can't keep a stale list
   const topupId = created && created.name ? String(created.name).split('/').pop() : '';
   if (!topupId) return badRequest('Could not save the top up request. Please try again.', 500);
 
