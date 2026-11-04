@@ -890,7 +890,7 @@ async function handleTelegramLinkCommand(env, msg) {
 
 const COST_WATCH_DOC = 'settings/costWatch';
 const DEFAULT_RESYNC_MARGIN_PCT = 3;   // used until the admin's margin has been saved to settings/pricing (or on the game)
-const COST_SOURCES_PER_TICK = 4;       // supplier catalogues checked per cron tick
+const COST_SOURCES_PER_TICK = 5;       // supplier catalogues checked per cron tick (was 4)
 const COST_REBUILD_MS = 3 * 60 * 60 * 1000;
 const COST_FLUSH_BATCH = 20;           // announce at once when this many games are waiting
 const COST_FLUSH_MAX_WAIT_MS = 3 * 60 * 1000;
@@ -906,7 +906,7 @@ function autoPriceForCost(cost, marginPct) {
   const step = priceStepFor(raw);
   return Math.ceil(raw / step) * step;
 }
-const COST_TICK_BUDGET = 10;   // max subrequests this sweep may spend per cron tick (raise it on a paid plan)
+const COST_TICK_BUDGET = 14;   // max subrequests this sweep may spend per cron tick (was 10; raise it on a paid plan)
 const COST_RESERVE = 2;        // kept back for the state save + a Telegram message
 const COST_BATCH_GAMES = 8;    // games read with ONE batchGet call
 const COST_DETAIL_CHUNK = 40;     // games per costUpdates/{cycle}_{k} doc (keeps each doc far below 1 MB)
@@ -2397,8 +2397,12 @@ async function runFirestoreBackupSweep(env, force = false) {
   if (!result.ok) console.error('runFirestoreBackupSweep: Telegram upload failed', JSON.stringify(result));
 }
 
-async function fulfillWalletOrders(env) {
-  const pending = (await queryPending(env, 'orders')).filter(d => d.fields.paidFromWallet === true);
+async function fulfillWalletOrders(env, onlyId) {
+  // onlyId: fulfil just this order right now (called straight after /create-order). Safe without the
+  // send lock because claimOrderForFulfillment() below is an atomic per-order claim.
+  const pending = onlyId
+    ? [{ id: String(onlyId) }]
+    : (await queryPending(env, 'orders')).filter(d => d.fields.paidFromWallet === true);
   if (!pending.length) return;
 
   const g2bulkDoc = await getDoc(env, 'settings/g2bulk');
@@ -2476,8 +2480,8 @@ async function fulfillWalletOrders(env) {
 const WALLET_FLOW = 2;
 let _gamesCache = null; // { at, docs } - short-lived, so a sweep of many orders reads the catalogue once
 
-async function getGamesCached(env) {
-  if (_gamesCache && Date.now() - _gamesCache.at < 30000) return _gamesCache.docs;
+async function getGamesCached(env, maxAgeMs = 30000) {
+  if (maxAgeMs > 0 && _gamesCache && Date.now() - _gamesCache.at < maxAgeMs) return _gamesCache.docs;
   const docs = await queryAllDocs(env, 'games');
   _gamesCache = { at: Date.now(), docs };
   return docs;
@@ -2562,12 +2566,13 @@ async function verifyWalletOwner(env, f) {
 
 // The authoritative price. Finds the catalogue package this order is for and
 // insists the order's price equals the catalogue's own list price.
-async function verifyWalletPrice(env, f) {
+async function verifyWalletPrice(env, f, maxAgeMs = 30000) {
   const price = Number(f.price);
   if (!Number.isInteger(price) || price < 0) return { ok: false, reason: 'Invalid price.' };
   const changed = { ok: false, reason: 'The price of this item has changed. Please reopen it and try again.' };
 
-  const games = await getGamesCached(env);
+  // maxAgeMs 0 = always re-read the catalogue, so the price compared is the one live right now.
+  const games = await getGamesCached(env, maxAgeMs);
   let best = null;
   for (const g of games) {
     const gf = g.fields;
@@ -2601,7 +2606,7 @@ async function verifyWalletPrice(env, f) {
 async function gateWalletOrder(env, f) {
   const owner = await verifyWalletOwner(env, f);
   if (!owner.ok) return owner;
-  const priced = await verifyWalletPrice(env, f);
+  const priced = await verifyWalletPrice(env, f, 5000); // sweeps check many orders per tick: <=5 s old is still live
   if (!priced.ok) return priced;
   const balance = Number(owner.user.fields.walletBalance) || 0;
   if (balance < priced.price) return { ok: false, reason: 'Insufficient wallet balance.' };
@@ -4269,7 +4274,7 @@ async function handleRegisterUser(request, env, ctx) {
       callAuthWorker(env, '/notify-connected', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ telegramId: uid.slice(3), guestId: id, name, balance: 0 })
+        body: JSON.stringify({ telegramId: uid.slice(3), guestId: id, name, username: tgUsername, balance: 0 })
       }).catch(e => console.error('new-customer Telegram DM failed', e && e.message))
     );
   }
@@ -4344,7 +4349,7 @@ async function authCustomerRequest(request, env, bucket, limit, windowSec, failC
 // The In-Game ID must pass the game's name check before an order is saved.
 //  * Direct G2Bulk games: the Worker calls G2Bulk's public checkPlayerId ITSELF and takes the player
 //    name from that answer (the browser's name is never trusted).
-//  * FazerCards / Aluu.in games: their check lives behind other Workers, so the Worker can only
+//  * FazerCards games: their check lives behind another Worker, so the Worker can only
 //    require the store's "ID verified" flag.
 //  * Games with no player ID (vouchers) and games without any name check are not touched.
 async function verifyPlayerName(env, f, o) {
@@ -4356,7 +4361,7 @@ async function verifyPlayerName(env, f, o) {
     // A direct top-up game always needs a player ID: leaving it out must not skip the name check.
     // Voucher / gift-card orders carry no player ID and stay untouched.
     const isCodeOrder = !!(f.g2bulkVoucherProductId || f.fazercardGiftCategoryId || f.jcplaysProduct);
-    if (!isCodeOrder && (gf.g2bulkCode || gf.fazercardCategoryId || gf.aluuCode)) {
+    if (!isCodeOrder && (gf.g2bulkCode || gf.fazercardCategoryId)) {
       return { ok: false, reason: 'Please enter your In-Game ID and check it first.' };
     }
     return { ok: true };
@@ -4378,7 +4383,7 @@ async function verifyPlayerName(env, f, o) {
     if (data && data.valid === 'valid') return { ok: true, name: cleanStr(data.name, 80) };
     return { ok: false, reason: 'ID not found. Please check your In-Game ID and try again.' };
   }
-  if (gf.fazercardCategoryId || gf.aluuCode) {
+  if (gf.fazercardCategoryId) {
     return o.idVerified === true ? { ok: true } : { ok: false, reason: 'Please check your In-Game ID first - the player name must appear before you can buy.' };
   }
   return { ok: true };
@@ -4451,6 +4456,17 @@ async function handleCreateOrder(request, env, ctx) {
   const o = body.order && typeof body.order === 'object' ? body.order : null;
   if (!o) return badRequest('Bad request');
   const wallet = body.wallet === true;
+
+  // IDEMPOTENCY: the browser sends one random clientRequestId per purchase attempt. If the
+  // first request really created the order but the reply was lost (network drop / timeout) and
+  // the customer taps again, we hand back the SAME order instead of creating - and, for wallet
+  // orders, charging - a second one. Checked first so a retry never trips the receipt/price checks.
+  const reqId = /^[A-Za-z0-9_-]{8,64}$/.test(wStr(body.clientRequestId)) ? wStr(body.clientRequestId) : '';
+  const reqPath = reqId ? `orderRequests/${customer.id}_${reqId}` : '';
+  if (reqPath) {
+    const prior = await getDoc(env, reqPath);
+    if (prior && wStr(prior.fields.orderId)) return corsJson({ ok: true, orderId: wStr(prior.fields.orderId), duplicate: true });
+  }
 
   const f = {
     playerId: cleanStr(o.playerId, 64),
@@ -4532,7 +4548,7 @@ async function handleCreateOrder(request, env, ctx) {
     // (same check wallet orders get in gateWalletOrder) BEFORE the order exists,
     // so a tampered price never reaches Telegram / the admin queue. Cost is also
     // taken from the catalogue, never from the browser.
-    const priced = await verifyWalletPrice(env, f);
+    const priced = await verifyWalletPrice(env, f, 0); // order placed now: compare against the live price, never a cached one
     if (!priced.ok) return badRequest(priced.reason, 409, 'PRICE_CHANGED');
     f.price = priced.price;
     f.cost = priced.cost;
@@ -4544,14 +4560,39 @@ async function handleCreateOrder(request, env, ctx) {
   f.userName = cleanStr(customer.fields.name, 60) || customer.id;
   f.userPhone = cleanStr(customer.fields.phone, 30);
 
-  let orderId = '';
-  for (let i = 0; i < 8 && !orderId; i++) {
-    const buf = new Uint32Array(1);
-    crypto.getRandomValues(buf);
-    const candidate = String(10000000 + (buf[0] % 90000000));
-    if (await createDocIfAbsent(env, `orders/${candidate}`, f)) orderId = candidate;
+  // Claim this request id BEFORE writing the order, so two taps / retries arriving at the same
+  // moment can't both get through. The claim is released if the order could not be saved.
+  if (reqPath) {
+    let claimed = false;
+    try { claimed = await createDocIfAbsent(env, reqPath, { status: 'claiming', createdAt: new Date() }); }
+    catch (e) { return badRequest('Could not save the order. Please try again.', 503); }
+    if (!claimed) {
+      const prior = await getDoc(env, reqPath);
+      if (prior && wStr(prior.fields.orderId)) return corsJson({ ok: true, orderId: wStr(prior.fields.orderId), duplicate: true });
+      return badRequest('Your previous request is still being processed. Please wait a moment and check History.', 409, 'IN_PROGRESS');
+    }
   }
-  if (!orderId) return badRequest('Could not save the order. Please try again.', 500);
+
+  let orderId = '';
+  try {
+    for (let i = 0; i < 8 && !orderId; i++) {
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      const candidate = String(10000000 + (buf[0] % 90000000));
+      if (await createDocIfAbsent(env, `orders/${candidate}`, f)) orderId = candidate;
+    }
+  } catch (e) {
+    if (reqPath) { try { await deleteFirestoreDoc(env, reqPath); } catch (_) {} }
+    throw e;
+  }
+  if (!orderId) {
+    if (reqPath) { try { await deleteFirestoreDoc(env, reqPath); } catch (_) {} }
+    return badRequest('Could not save the order. Please try again.', 500);
+  }
+  if (reqPath) {
+    try { await patchDoc(env, reqPath, { orderId }, ['orderId']); }
+    catch (e) { console.error('orderRequests link failed', e); }
+  }
 
   alertHighValue(env, ctx, 'order', orderId, f);
   // Telegram card / wallet auto-fulfil right away (the cron stays as the safety net).
@@ -4560,7 +4601,11 @@ async function handleCreateOrder(request, env, ctx) {
   // claim, and skipped if the sweep already moved the order past Pending (that status
   // change sends its own tracker update).
   ctx.waitUntil((async () => {
-    try { await runPingSweep(env, 'order'); } catch (e) { console.error('post-create sweep failed', e); }
+    try {
+      // Wallet orders: fulfil THIS order immediately - no waiting on the send lock the cron may be holding.
+      if (f.paidFromWallet === true) await fulfillWalletOrders(env, orderId);
+      else await runPingSweep(env, 'order');
+    } catch (e) { console.error('post-create sweep failed', e); }
     try {
       const fresh = await getDoc(env, `orders/${orderId}`);
       if (fresh && fresh.fields.status === 'Pending') await notifyOrderDm(env, orderId, fresh.fields, 'Pending');
