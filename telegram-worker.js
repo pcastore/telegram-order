@@ -991,7 +991,7 @@ function yangonStamp(iso) {
   return new Date(ms).toLocaleString('en-GB', { timeZone: 'Asia/Yangon', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
 }
 const COST_KIND_LABEL = { g2bulk: 'G2Bulk', jcplays: 'JCPlays', voucher: 'G2Bulk Voucher', fazer: 'FazerCards' };
-const HEALTH_KB = { inline_keyboard: [[{ text: '🔄 Re-check', callback_data: 'health:run' }, { text: '⚠️ Errors', callback_data: 'health:errors' }]] };
+const HEALTH_KB = { inline_keyboard: [[{ text: '🔄 Re-check', style: 'primary', callback_data: 'health:run' }, { text: '⚠️ Errors', style: 'danger', callback_data: 'health:errors' }]] };
 
 async function buildHealthReport(env, errorsOnly) {
   let errDoc = null;
@@ -1722,7 +1722,7 @@ function buildOrderMessage(id, f, balanceInfo) {
     { text: '❌ Reject', style: 'danger', callback_data: `reject:${id}` }
   ];
   const pid = String(f.playerId || '').trim().slice(0, 256);
-  const copyRow = pid ? [{ text: '📋 Copy Player ID', copy_text: { text: pid } }] : [];
+  const copyRow = pid ? [{ text: '📋 Copy Player ID', style: 'primary', copy_text: { text: pid } }] : [];
   return { text, buttons, copyRow, photo: f.receiptUrl || null, rich: buildOrderRich(id, f, balanceInfo) };
 }
 
