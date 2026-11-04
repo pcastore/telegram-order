@@ -997,16 +997,23 @@ async function buildHealthReport(env, errorsOnly) {
   let errDoc = null;
   try { errDoc = await getDoc(env, HEALTH_DOC); } catch (e) { /* shown below */ }
   const errs = errDoc && Array.isArray(errDoc.fields.errors) ? errDoc.fields.errors.map(String) : [];
-  const errBlock = errs.length
-    ? errs.slice(-8).reverse().map(l => { const p = l.split('|'); return `• ${yangonStamp(p[0])} [${esc(p[1] || '?')}] ${esc(p.slice(2).join('|'))}`; }).join('\n')
+  const errList = errs.slice(-8).reverse().map(l => { const q = l.split('|'); return [yangonStamp(q[0]), q[1] || '?', q.slice(2).join('|')]; });
+  const errHtml = errList.length
+    ? errList.map(e => `• ${e[0]} [${esc(e[1])}] ${esc(e[2])}`).join('\n')
     : '✅ No errors recorded';
-  if (errorsOnly) return `⚠️ <b>Recent Worker errors</b> (Yangon time)\n${errBlock}`;
+  const errTable = errList.length
+    ? richGrid(['Time', 'Source', 'Error'], errList)
+    : richKV([['Errors', '✅ No errors recorded']]);
+  if (errorsOnly) {
+    return { html: `⚠️ <b>Recent Worker errors</b> (Yangon time)\n${errHtml}`,
+      blocks: [{ type: 'heading', size: 2, text: '⚠️ Recent Worker errors (Yangon time)' }, errTable] };
+  }
 
-  const out = ['🩺 <b>Worker health</b>'];
+  const items = []; // [label, value]
   const required = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'TELEGRAM_WEBHOOK_SECRET', 'FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY'];
   const missing = required.filter(k => !env[k]);
-  out.push(missing.length ? `❌ Missing secrets: <code>${missing.join(', ')}</code>` : '✅ Secrets present');
-  if (!env.SWEEP_SECRET) out.push('ℹ️ SWEEP_SECRET not set (/run-sweep is off)');
+  items.push(['🔐 Secrets', missing.length ? `❌ Missing: ${missing.join(', ')}` : '✅ Present']);
+  if (!env.SWEEP_SECRET) items.push(['🧹 SWEEP_SECRET', 'ℹ️ not set (/run-sweep is off)']);
 
   // Firestore: real HTTP status, so a quota / permission problem is not mistaken for "doc missing".
   let watch = {};
@@ -1015,32 +1022,43 @@ async function buildHealthReport(env, errorsOnly) {
     const token = await getAccessToken(env);
     const r = await fetch(`${firestoreDocsBase(env)}/${COST_WATCH_DOC}`, { headers: { Authorization: `Bearer ${token}` } });
     const ms = Date.now() - t0;
-    if (r.ok) { const d = await r.json(); watch = decodeFields(d.fields || {}); out.push(`✅ Firestore OK (${ms} ms)`); }
-    else if (r.status === 404) out.push(`✅ Firestore OK (${ms} ms) · cost watch not created yet`);
-    else out.push(`❌ Firestore HTTP ${r.status}${r.status === 429 ? ' (quota exceeded)' : ''}`);
-  } catch (e) { out.push('❌ Firestore auth: ' + esc(String(e.message || e)).slice(0, 140)); }
+    if (r.ok) { const d = await r.json(); watch = decodeFields(d.fields || {}); items.push(['🗄 Firestore', `✅ OK (${ms} ms)`]); }
+    else if (r.status === 404) items.push(['🗄 Firestore', `✅ OK (${ms} ms) · cost watch not created yet`]);
+    else items.push(['🗄 Firestore', `❌ HTTP ${r.status}${r.status === 429 ? ' (quota exceeded)' : ''}`]);
+  } catch (e) { items.push(['🗄 Firestore', '❌ Auth: ' + String(e.message || e).slice(0, 140)]); }
 
   try {
     const me = await tgApi(env, 'getMe', {});
-    out.push(me && me.ok ? `✅ Telegram bot OK (@${esc(me.result && me.result.username || '?')})` : '❌ Telegram getMe failed');
-  } catch (e) { out.push('❌ Telegram: ' + esc(String(e.message || e)).slice(0, 120)); }
+    items.push(['🤖 Telegram bot', me && me.ok ? `✅ OK (@${(me.result && me.result.username) || '?'})` : '❌ getMe failed']);
+  } catch (e) { items.push(['🤖 Telegram bot', '❌ ' + String(e.message || e).slice(0, 120)]); }
 
   try {
     const cfg = buildCostCfg(await batchGetDocs(env, ['settings/g2bulk', 'settings/jcplays', 'settings/fazercard', 'settings/pricing']));
-    out.push(`🔌 Suppliers: G2Bulk ${cfg.g2bulkOff ? 'OFF' : 'on'} · JCPlays ${cfg.jcplaysOk ? 'ready' : 'not set'} · FazerCards ${cfg.fazerOk ? 'ready' : 'not set'}`);
-  } catch (e) { out.push('❌ Supplier settings: ' + esc(String(e.message || e)).slice(0, 100)); }
+    items.push(['🔌 Suppliers', `G2Bulk ${cfg.g2bulkOff ? 'OFF' : 'on'} · JCPlays ${cfg.jcplaysOk ? 'ready' : 'not set'} · FazerCards ${cfg.fazerOk ? 'ready' : 'not set'}`]);
+  } catch (e) { items.push(['🔌 Suppliers', '❌ ' + String(e.message || e).slice(0, 100)]); }
 
   const nSrc = Array.isArray(watch.sources) ? watch.sources.length : 0;
   const builtMin = watch.builtAt ? Math.round((Date.now() - Number(watch.builtAt)) / 60000) : null;
-  out.push(`💱 Cost watch: ${nSrc} catalogue(s)` + (builtMin !== null ? ` · list built ${builtMin} min ago` : ' · list not built yet') +
-    ` · retry ${Array.isArray(watch.retry) ? watch.retry.length : 0} · waiting rows ${Array.isArray(watch.rows) ? watch.rows.length : 0}`);
-  out.push('', '⚠️ <b>Recent errors</b>', errBlock);
-  return out.join('\n');
+  items.push(['💱 Cost watch', `${nSrc} catalogue(s)` + (builtMin !== null ? ` · list built ${builtMin} min ago` : ' · list not built yet') +
+    ` · retry ${Array.isArray(watch.retry) ? watch.retry.length : 0} · waiting rows ${Array.isArray(watch.rows) ? watch.rows.length : 0}`]);
+
+  const html = ['🩺 <b>Worker health</b>', ...items.map(([k, v]) => `${esc(k)}: ${esc(v)}`), '', '⚠️ <b>Recent errors</b>', errHtml].join('\n');
+  const blocks = [
+    { type: 'heading', size: 2, text: '🩺 Worker health' },
+    richKV(items),
+    { type: 'heading', size: 3, text: '⚠️ Recent errors' },
+    errTable
+  ];
+  return { html, blocks };
 }
 
 async function sendHealthReport(env, chatId, threadId, errorsOnly) {
-  const text = await buildHealthReport(env, errorsOnly);
-  await tgApi(env, 'sendMessage', { chat_id: chatId, message_thread_id: threadId, parse_mode: 'HTML', text, reply_markup: HEALTH_KB });
+  const { html, blocks } = await buildHealthReport(env, errorsOnly);
+  const to = { chat_id: chatId, message_thread_id: threadId };
+  const r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, reply_markup: HEALTH_KB });
+  if (r && r.ok) return;
+  console.error('rich health report failed, using HTML', JSON.stringify(r));
+  await tgApi(env, 'sendMessage', { ...to, parse_mode: 'HTML', text: html, reply_markup: HEALTH_KB });
 }
 
 function makeSubrequestBudget(total) {
@@ -1241,10 +1259,10 @@ function richCostTable(rows, up, down) {
     const pct = r.oldV ? ((r.newV - r.oldV) / r.oldV * 100) : 0;
     const arrow = r.newV > r.oldV ? up : r.newV < r.oldV ? down : '=';
     const chg = r.oldV ? `${arrow} ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%` : arrow;
-    return [c(r.name, 'left'), c(r.oldV.toLocaleString(), 'right'), c(r.newV.toLocaleString(), 'right'), c(chg, 'right')];
+    return [c(r.name, 'center'), c(r.oldV.toLocaleString(), 'center'), c(r.newV.toLocaleString(), 'center'), c(chg, 'center')];
   });
   return { type: 'table', is_bordered: true, is_striped: true,
-    cells: [[hc('Currency', 'left'), hc('Old', 'right'), hc('Now', 'right'), hc('Change', 'right')], ...body] };
+    cells: [[hc('Currency', 'center'), hc('Old', 'center'), hc('Now', 'center'), hc('Change', 'center')], ...body] };
 }
 // ONE Telegram message per game: the game name is the title, then a Cost table (and a Price table
 // if any selling price moved). Each row is stored as 'RICH1:' + JSON {rich, html}: sent as a native
@@ -1398,7 +1416,7 @@ async function flushCostRows(env, state, budget) {
     }
     return `🎮 Game ${i + 1}`;
   };
-  const buttons = items.map((row, i) => ({ text: labelOf(row, i).slice(0, 40), callback_data: `cost:${flushId}:${i}` }));
+  const buttons = items.map((row, i) => ({ text: (() => { const t = labelOf(row, i); return t.length > 24 ? t.slice(0, 23) + '…' : t; })(), callback_data: `cost:${flushId}:${i}` }));
   const y = yangonNow();
   const hhmm = `${String(y.getUTCHours()).padStart(2, '0')}:${String(y.getUTCMinutes()).padStart(2, '0')}`;
   for (let m = 0; m < parts; m++) {
@@ -1407,7 +1425,18 @@ async function flushCostRows(env, state, budget) {
     for (let i = 0; i < slice.length; i += 2) kb.push(slice.slice(i, i + 2));
     const head = `💱 <b>Cost updated</b> (${hhmm}) — ${state.rowsPkgs} package(s) in ${state.rowsGames} game(s)` +
       (parts > 1 ? ` · ${m + 1}/${parts}` : '') + '\n👇 Tap a game to see its table';
-    const r = await tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML', text: head, reply_markup: { inline_keyboard: kb } });
+    const r = await sendRichAlert(env, {
+      title: '💱 Cost updated',
+      rows: [
+        ['🕐 Time (Yangon)', hhmm],
+        ['📦 Packages', String(state.rowsPkgs)],
+        ['🎮 Games', String(state.rowsGames)],
+        ...(parts > 1 ? [['📄 Page', `${m + 1}/${parts}`]] : [])
+      ],
+      note: '👇 Tap a game to see its table',
+      html: head,
+      replyMarkup: { inline_keyboard: kb }
+    });
     budget.spend(1);
     if (!(r && r.ok)) { console.error('Cost update index message failed', JSON.stringify(r)); return false; }
   }
@@ -1480,12 +1509,14 @@ async function runAutoCostUpdateSweep(env) {
       if (budget.left() < COST_RESERVE + 5) { retryNext.push(k); continue; }   // cannot afford the message this tick - try again next tick
       budget.spend(1);
       try {
-        const r = await tgApi(env, 'sendMessage', {
-          chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-          text: '💱 <b>Cost Update starting</b>\n' +
+        const r = await sendRichAlert(env, {
+          title: '💱 Cost Update starting',
+          rows: [['🏭 Supplier', String(COST_KIND_LABEL[src.kind] || src.kind)], ['🎮 Games', `${src.g.length} game(s) use this catalogue`]],
+          note: 'Supplier ဘက် Cost ပြောင်းလဲမှု တွေ့လို့ Update စတင်ပါပြီ။ ပြီးရင် Game စာရင်း Message ပို့ပေးပါမယ်။',
+          html: '💱 <b>Cost Update starting</b>\n' +
             `Supplier: <b>${esc(COST_KIND_LABEL[src.kind] || src.kind)}</b> · ${src.g.length} game(s) use this catalogue\n` +
             'Supplier ဘက် Cost ပြောင်းလဲမှု တွေ့လို့ Update စတင်ပါပြီ။ ပြီးရင် Game စာရင်း Message ပို့ပေးပါမယ်။',
-          reply_markup: HEALTH_KB
+          replyMarkup: HEALTH_KB
         });
         if (!(r && r.ok)) noteWorkerError('cost', 'heads-up message failed: ' + JSON.stringify(r).slice(0, 100));
       } catch (e) { noteWorkerError('cost', 'heads-up message error: ' + (e && e.message)); }
@@ -1616,6 +1647,32 @@ function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Centred, bordered rich-message tables (same look as the order card). Block text is literal.
+const rtHead = (text) => ({ text: String(text), is_header: true, align: 'center', valign: 'middle' });
+const rtCell = (text) => ({ text: String(text), align: 'center', valign: 'middle' });
+// label | value rows (label column = header cells); `note` = one merged full-width row.
+function richKV(rows, note) {
+  const cells = rows.map(([k, v]) => [rtHead(k), rtCell(v)]);
+  if (note) cells.push([{ text: String(note), align: 'center', valign: 'middle', colspan: 2 }]);
+  return { type: 'table', is_bordered: true, cells };
+}
+// header row + body rows; `note` = merged row spanning every column.
+function richGrid(header, rows, note) {
+  const cells = [header.map(rtHead), ...rows.map(r => r.map(rtCell))];
+  if (note) cells.push([{ text: String(note), align: 'center', valign: 'middle', colspan: header.length }]);
+  return { type: 'table', is_bordered: true, is_striped: true, cells };
+}
+// One alert as a rich table; falls back to the HTML text if Telegram refuses the rich message.
+async function sendRichAlert(env, o) {
+  const to = { chat_id: o.chatId || env.TELEGRAM_CHAT_ID, ...(o.threadId ? { message_thread_id: o.threadId } : {}) };
+  const kb = o.replyMarkup ? { reply_markup: o.replyMarkup } : {};
+  const blocks = [{ type: 'heading', size: 2, text: o.title }, o.table || richKV(o.rows, o.note)];
+  const r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, ...kb });
+  if (r && r.ok) return r;
+  console.error('rich alert failed, using HTML', JSON.stringify(r));
+  return tgApi(env, 'sendMessage', { ...to, parse_mode: 'HTML', text: o.html, ...kb });
+}
+
 // Icon + bold-label rows meant to sit inside a <blockquote> (order/topup
 // cards) - replaces the old padEnd-aligned "Label  -  Value" layout, which
 // only lined up in a monospace font; Telegram's blockquote text is
@@ -1686,9 +1743,10 @@ function buildOrderRich(id, f, balanceInfo) {
     ['💳 Payment', String(f.paymentMethod || 'N/A')],
     ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
     when && when !== 'Invalid Date' ? ['🕐 Time', when] : null,
-    ORDER_STATUS_LABEL[f.status] ? ['📌 Status', ORDER_STATUS_LABEL[f.status]] : null
+    ORDER_STATUS_LABEL[f.status] ? ['📌 Status', ORDER_STATUS_LABEL[f.status]] : null,
+    ['🔖 Order ID', String(id)]
   ].filter(Boolean);
-  const cell = (text, header) => ({ text: String(text), is_header: !!header, align: 'left', valign: 'middle' });
+  const cell = (text, header) => ({ text: String(text), is_header: !!header, align: 'center', valign: 'middle' });
   const blocks = [
     { type: 'heading', size: 2, text: f.status && f.status !== 'Pending' ? '🛒 Order' : '🛒 New Order ✨' },
     { type: 'table', is_bordered: true, cells: rows.map(([k, v]) => [cell(k, true), cell(v, false)]) }
@@ -1698,7 +1756,6 @@ function buildOrderRich(id, f, balanceInfo) {
       ? `⚠️ G2Bulk Balance LOW: ${balanceInfo.balanceUsd.toFixed(2)} USD (~${Math.round(balanceInfo.mmkEquivalent).toLocaleString()} MMK) — not enough to cover this order`
       : `💰 G2Bulk Balance: ${balanceInfo.balanceUsd.toFixed(2)} USD (~${Math.round(balanceInfo.mmkEquivalent).toLocaleString()} MMK)` });
   }
-  blocks.push({ type: 'paragraph', text: `🔖 Order ID: ${id}` });
   return { blocks };
 }
 
@@ -1718,7 +1775,26 @@ function buildTopupMessage(id, f) {
     { text: '✅ Confirm & Credit', style: 'success', callback_data: `wtopup_confirm:${id}` },
     { text: '❌ Reject', style: 'danger', callback_data: `wtopup_reject:${id}` }
   ];
-  return { text, buttons, photo: f.receiptUrl || null };
+  return { text, buttons, photo: f.receiptUrl || null, rich: buildTopupRich(id, f) };
+}
+
+// Same top-up card as a centred bordered table (rich message). Re-rendered by editResolvedMessage()
+// when the top-up is credited / rejected, so the Status row always matches.
+const TOPUP_STATUS_LABEL = { Completed: '✅ Completed — Wallet credited', Rejected: '❌ Rejected' };
+function buildTopupRich(id, f) {
+  const when = f.timestamp ? new Date(Date.parse(f.timestamp)).toLocaleString('en-GB', { timeZone: 'Asia/Yangon', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+  const rows = [
+    ['💵 Amount', Number(f.amount || 0).toLocaleString() + ' MMK'],
+    ['💳 Payment', String(f.paymentMethod || 'N/A')],
+    ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
+    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null,
+    TOPUP_STATUS_LABEL[f.status] ? ['📌 Status', TOPUP_STATUS_LABEL[f.status]] : null,
+    ['🔖 Request ID', String(id)]
+  ].filter(Boolean);
+  return { blocks: [
+    { type: 'heading', size: 2, text: f.status && f.status !== 'Pending' ? '💰 Wallet Top Up' : '💰 Wallet Top Up Request' },
+    richKV(rows)
+  ] };
 }
 
 // ---------------------------------------------------------------------------
@@ -1991,9 +2067,9 @@ async function sweepCollection(env, collectionId, buildMessage) {
 
     // Second row: one-tap "Copy Player ID" (native copy button) on order cards.
     const kb = (withCopy) => ({ inline_keyboard: [buttons, ...(withCopy && copyRow && copyRow.length ? [copyRow] : [])] });
-    // Orders: bordered table card (receipt photo, if any, goes first as its own small message).
+    // Orders and wallet top-ups: bordered table card (receipt photo, if any, goes first as its own small message).
     // Anything Telegram refuses falls through to the classic text/photo card below, so a card is never lost.
-    if (collectionId === 'orders' && rich) {
+    if (rich) {
       let receiptMsgId = null;
       if (photo) {
         const pr = await tgApi(env, 'sendPhoto', { chat_id: env.TELEGRAM_CHAT_ID, photo, caption: `🧾 Receipt · ${d.id.slice(0, 8)}` });
@@ -2196,21 +2272,21 @@ const ORDERS_IN_RICH = 250;
 async function trySendRichSummary(env, { periodLabel, periodStr, statsRows, unmatchedCount, games, periodOrders }) {
   try {
     const hc = (text, align) => ({ text, is_header: true, align, valign: 'middle' });
-    const c = (text, align = 'left') => ({ text, align, valign: 'middle' });
+    const c = (text, align = 'center') => ({ text, align, valign: 'middle' });
     const blocks = [
       { type: 'heading', size: 2, text: `📊 ${periodLabel} — ${periodStr}` },
       { type: 'table', is_bordered: true, is_striped: true, is_compact: true,
-        cells: statsRows.map(([icon, label, value]) => [c(`${icon} ${label}`), c(String(value), 'right')]) }
+        cells: statsRows.map(([icon, label, value]) => [c(`${icon} ${label}`), c(String(value), 'center')]) }
     ];
     if (unmatchedCount > 0) blocks.push({ type: 'paragraph', text: `⚠️ ${unmatchedCount} order(s) couldn't be matched to a package cost — excluded from Cost/Profit above.` });
     const report = buildPerGameProfitReport(games, periodOrders).slice(0, 100);
     if (report.length) {
       blocks.push({ type: 'heading', size: 3, text: '📦 Per-Game Profit (worst margin first)' });
       blocks.push({ type: 'table', is_bordered: true, is_striped: true, is_compact: true, cells: [
-        [hc('Game', 'left'), hc('Orders', 'right'), hc('Sales', 'right'), hc('Profit', 'right'), hc('Margin', 'right')],
+        [hc('Game', 'center'), hc('Orders', 'center'), hc('Sales', 'center'), hc('Profit', 'center'), hc('Margin', 'center')],
         ...report.map(r => {
           const flag = r.marginPct < 0 ? '🔴' : r.marginPct < 5 ? '🟡' : '🟢';
-          return [c(r.game + (r.unmatched ? ` (${r.unmatched} unmatched)` : '')), c(String(r.count), 'right'), c(r.sales.toLocaleString(), 'right'), c(r.profit.toLocaleString(), 'right'), c(`${flag} ${r.marginPct.toFixed(1)}%`, 'right')];
+          return [c(r.game + (r.unmatched ? ` (${r.unmatched} unmatched)` : '')), c(String(r.count), 'center'), c(r.sales.toLocaleString(), 'center'), c(r.profit.toLocaleString(), 'center'), c(`${flag} ${r.marginPct.toFixed(1)}%`, 'center')];
         })
       ] });
     }
@@ -2221,11 +2297,11 @@ async function trySendRichSummary(env, { periodLabel, periodStr, statsRows, unma
         const ms = o.fields.timestamp ? Date.parse(o.fields.timestamp) : 0;
         const fb = ms ? new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Yangon' }) : '--:--';
         const timeCell = ms ? { type: 'date_time', text: fb, unix_time: Math.floor(ms / 1000), date_time_format: 't' } : fb;
-        return [c(String(i + 1), 'right'), c(timeCell), c(String(o.fields.game || '')), c(String(o.fields.itemAmount || '')), c(Number(o.fields.price || 0).toLocaleString(), 'right'), c(String(o.fields.status || ''))];
+        return [c(String(i + 1), 'center'), c(timeCell), c(String(o.fields.game || '')), c(String(o.fields.itemAmount || '')), c(Number(o.fields.price || 0).toLocaleString(), 'center'), c(String(o.fields.status || ''))];
       });
       blocks.push({ type: 'details', summary: `🧾 Orders (${sorted.length})`, is_open: false, blocks: [
         { type: 'table', is_bordered: true, is_striped: true, is_compact: true, cells: [
-          [hc('#', 'right'), hc('Time', 'left'), hc('Game', 'left'), hc('Package', 'left'), hc('Price', 'right'), hc('Status', 'left')], ...rows] }
+          [hc('#', 'center'), hc('Time', 'center'), hc('Game', 'center'), hc('Package', 'center'), hc('Price', 'center'), hc('Status', 'center')], ...rows] }
       ] });
     }
     const r = await tgApi(env, 'sendRichMessage', { chat_id: env.TELEGRAM_CHAT_ID, rich_message: { blocks } });
@@ -2880,9 +2956,11 @@ async function chargeWalletAfterProvider(env, orderId, chargeAmount, cost, quiet
   if (quiet) return;   // reconcile retries run every tick - the admin was already alerted the first time
   try {
     await patchDoc(env, `orders/${orderId}`, { walletDebitFailed: true }, ['walletDebitFailed']);
-    await tgApi(env, 'sendMessage', {
-      chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-      text: `🚨 <b>Wallet debit FAILED</b>\n\nOrder <code>${orderId}</code> was accepted by the provider but the customer's wallet could not be charged (${Number(chargeAmount).toLocaleString()} MMK). Charge it by hand in the admin panel.`
+    await sendRichAlert(env, {
+      title: '🚨 Wallet debit FAILED',
+      rows: [['🔖 Order', String(orderId)], ['💵 Amount', Number(chargeAmount).toLocaleString() + ' MMK']],
+      note: "Provider accepted the order but the customer's wallet could not be charged. Charge it by hand in the admin panel.",
+      html: `🚨 <b>Wallet debit FAILED</b>\n\nOrder <code>${orderId}</code> was accepted by the provider but the customer's wallet could not be charged (${Number(chargeAmount).toLocaleString()} MMK). Charge it by hand in the admin panel.`
     });
   } catch (e) { console.error('debit-failed alert error', e); }
 }
@@ -3046,7 +3124,18 @@ async function notifyAdminAutoRefund(env, orderId, fields, statusNote, amount) {
       + `Amount: ${Number(amount || 0).toLocaleString()} MMK\n`
       + `Reason: ${statusNote}\n\n`
       + `Wallet was auto-refunded after repeated fulfillment failures. Check the provider (balance/API status) before more orders hit the same wall.`;
-    await tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML', text });
+    await sendRichAlert(env, {
+      title: '⚠️ Auto-Refund Issued',
+      rows: [
+        ['🔖 Order', String(orderId)],
+        ['🎮 Game', String(fields.game || '-')],
+        ['👤 User', String(fields.userId || '-')],
+        ['💵 Amount', Number(amount || 0).toLocaleString() + ' MMK'],
+        ['📝 Reason', String(statusNote)]
+      ],
+      note: 'Wallet was auto-refunded after repeated fulfillment failures. Check the provider (balance/API status) before more orders hit the same wall.',
+      html: text
+    });
   } catch (err) {
     console.error('notifyAdminAutoRefund error', orderId, err);
   }
@@ -3418,9 +3507,11 @@ async function fulfillJCPlaysOrder(env, orderId, fields, jcplays) {
       status: 'Processing',
       statusNote: `JCPlays order call failed (${err.message}) — balance may already be charged. Verify manually in the JCPlays dashboard/transaction history, then resolve this order by hand.`
     }, ['status', 'statusNote']);
-    await tgApi(env, 'sendMessage', {
-      chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-      text: `⚠️ <b>JCPlays order needs manual check</b>\nOrder <code>${esc(orderId)}</code> — createorder call failed: ${esc(err.message)}\n\nThis was <b>not</b> auto-retried (JCPlays has no dedup key, so a blind retry could double-charge). Check the JCPlays dashboard/transaction history, then resolve this order from the admin panel.`
+    await sendRichAlert(env, {
+      title: '⚠️ JCPlays order needs manual check',
+      rows: [['🔖 Order', String(orderId)], ['❗ Error', 'createorder call failed: ' + err.message]],
+      note: 'Not auto-retried (JCPlays has no dedup key, a blind retry could double-charge). Check the JCPlays dashboard/transaction history, then resolve this order from the admin panel.',
+      html: `⚠️ <b>JCPlays order needs manual check</b>\nOrder <code>${esc(orderId)}</code> — createorder call failed: ${esc(err.message)}\n\nThis was <b>not</b> auto-retried (JCPlays has no dedup key, so a blind retry could double-charge). Check the JCPlays dashboard/transaction history, then resolve this order from the admin panel.`
     });
     return;
   }
@@ -4404,6 +4495,17 @@ async function createDocIfAbsent(env, path, fields) {
 
 function notifyNewCustomer(env, ctx, info) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  const custRows = [
+    ['🆔 ID', String(info.id)],
+    ['👤 Name', String(info.name || '-')],
+    ['🔑 Sign-in', String(info.label)],
+    info.email ? ['📧 Email', String(info.email)] : null,
+    info.telegramId ? ['✈️ Telegram ID', String(info.telegramId)] : null,
+    info.username ? ['🏷️ Username', '@' + info.username] : null,
+    ['💼 Wallet', '0 MMK'],
+    ['🕐 Time', nowStr]
+  ].filter(Boolean);
   const lines = [
     'New customer registered',
     `ID: <code>${esc(info.id)}</code>`,
@@ -4416,7 +4518,7 @@ function notifyNewCustomer(env, ctx, info) {
   lines.push('Wallet: 0 MMK');
   lines.push(`Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`);
   ctx.waitUntil(
-    tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML' })
+    sendRichAlert(env, { title: '🆕 New customer registered', rows: custRows, html: lines.join('\n') })
       .catch(e => console.error('new-customer Telegram notice failed', e && e.message))
   );
 }
@@ -4665,7 +4767,13 @@ function alertHighValue(env, ctx, kind, id, f) {
   const text = `💰 <b>High-value ${kind}</b>\n\n${kind === 'order' ? 'Order' : 'Top-up'}: <code>${id}</code>\n`
     + `User: <code>${f.userId || '-'}</code>\nAmount: ${amount.toLocaleString()} MMK`
     + (f.game ? `\nGame: ${f.game}` : '') + `\n\nCheck the receipt carefully before approving.`;
-  ctx.waitUntil(tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML', text }).catch(() => {}));
+  const hvRows = [
+    [kind === 'order' ? '🔖 Order' : '🔖 Top-up', String(id)],
+    ['👤 User', String(f.userId || '-')],
+    ['💵 Amount', amount.toLocaleString() + ' MMK'],
+    f.game ? ['🎮 Game', String(f.game)] : null
+  ].filter(Boolean);
+  ctx.waitUntil(sendRichAlert(env, { title: `💰 High-value ${kind}`, rows: hvRows, note: 'Check the receipt carefully before approving.', html: text }).catch(() => {}));
 }
 
 // Who did what (Telegram Confirm/Reject buttons). Written with the service account; keep the
