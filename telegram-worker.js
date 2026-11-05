@@ -122,6 +122,7 @@ export default {
       return new Response('forbidden', { status: 403 });
     }
     const res = await routeRequest(request, env, ctx, url);
+    ctx.waitUntil(flushTgSent(env));
     return allowed ? applyOriginCors(res, origin, allowed) : res;
   }
 };
@@ -1061,7 +1062,12 @@ async function buildHealthReport(env, errorsOnly) {
 // Bot API 10.3: buttons INSIDE the message bubble (InputRichBlockButtons) instead of a keyboard hanging under it.
 // One "buttons" block = one row (1-8 buttons); the button fields are the same as an inline-keyboard button's.
 // Falls back to a normal reply_markup keyboard wherever Telegram refuses the rich message.
+// Buttons now go out as a normal inline keyboard under the message: Telegram makes every row the same full
+// width and splits it equally, so single buttons (Back / Cancel) are exactly as wide as the pairs above them.
+// Set true to go back to buttons drawn inside the bubble (padded with filler).
+const BUTTONS_IN_BUBBLE = false;
 function richWithButtons(rich, markup) {
+  if (!BUTTONS_IN_BUBBLE) return rich ? { ...rich, __kb: markup } : rich; // tgApi() turns __kb into reply_markup
   const rows = markup && Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard.filter(r => r && r.length) : [];
   if (!rich || !rows.length) return rich;
   const blocks = Array.isArray(rich.blocks) ? rich.blocks.slice() : [];
@@ -1658,6 +1664,10 @@ function evenButtonGrid(btns, padCb, opts) {
 }
 function cleanInlineMarkup(markup) {
   if (!markup || !Array.isArray(markup.inline_keyboard)) return markup;
+  if (!BUTTONS_IN_BUBBLE) { // equal-width rows are done by Telegram: just clean the labels, never pad
+    return { ...markup, inline_keyboard: markup.inline_keyboard.filter(r => Array.isArray(r) && r.length)
+      .map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text.replace(/\u2800/g, '')) } : b))) };
+  }
   return { ...markup, inline_keyboard: padKeyboardEven(markup.inline_keyboard.map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b)))) };
 }
 // No emoji anywhere: human-visible text (message text, captions, button labels, rich blocks) is cleaned just
@@ -1676,6 +1686,11 @@ function stripEmojiDeep(v, inText) {
   return v;
 }
 async function tgApi(env, method, payload) {
+  if (payload && payload.rich_message && payload.rich_message.__kb !== undefined) {
+    const { __kb, ...rm } = payload.rich_message;
+    payload = { ...payload, rich_message: rm };
+    if (__kb && !payload.reply_markup) payload.reply_markup = __kb;
+  }
   if (payload && payload.reply_markup) payload = { ...payload, reply_markup: cleanInlineMarkup(payload.reply_markup) };
   if (payload && typeof payload === 'object') payload = stripEmojiDeep(payload, false);
   const call = async (pl) => {
@@ -1697,7 +1712,65 @@ async function tgApi(env, method, payload) {
     if ('caption' in pl) pl.caption = strip(pl.caption);
     out = await call(pl);
   }
+  noteTgSent(env, method, payload, out);
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-clean for the admin Telegram chat: every message this Worker sends there (order / top-up cards,
+// Cost updates, alerts, ...) is deleted 7 DAYS after it was sent. (The customer bot - pcastore.js - cleans its
+// own store screens after 3 hours.) Cheap on subrequests: sends are only queued in memory, then written as ONE
+// Firestore doc per request/cron tick ("tgSentLog"); a sweep every 10 minutes deletes what is due.
+// Telegram may refuse to delete very old messages (the Bot API limits deleting to roughly 48 hours in some chats);
+// anything it refuses is simply skipped and dropped from the log so it never blocks the sweep.
+// The Firestore backup files (.gz) are sent separately and are never deleted.
+// ---------------------------------------------------------------------------
+const TG_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+const TG_SWEEP_MAX = 5;            // deleteMessage calls per sweep (kept small so the cron tick stays under the subrequest limit; raise on a paid plan)
+const TG_SWEEP_EVERY_MIN = 10;     // run the sweep when the minute is a multiple of this
+let _tgSentQ = [];
+function noteTgSent(env, method, payload, out) {
+  try {
+    if (!/^send/.test(method) || !out || out.ok !== true || !payload) return;
+    if (String(payload.chat_id) !== String(env.TELEGRAM_CHAT_ID)) return; // admin chat only, never customer DMs
+    const r = out.result;
+    for (const m of (Array.isArray(r) ? r : [r])) if (m && m.message_id) _tgSentQ.push(`${payload.chat_id}:${m.message_id}`);
+  } catch (e) { /* never block a send */ }
+}
+async function flushTgSent(env) {
+  if (!_tgSentQ.length) return;
+  const items = _tgSentQ; _tgSentQ = [];
+  try {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await patchDoc(env, `tgSentLog/${id}`, { m: items, due: new Date(Date.now() + TG_KEEP_MS).toISOString() }, ['m', 'due']);
+  } catch (e) { console.error('flushTgSent failed', e && e.message); }
+}
+async function sweepExpiredTgMessages(env, force = false) {
+  try {
+    if (!force && new Date().getUTCMinutes() % TG_SWEEP_EVERY_MIN !== 3) return;
+    const token = await getAccessToken(env);
+    const res = await fetch(`https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ structuredQuery: { from: [{ collectionId: 'tgSentLog' }],
+        where: { fieldFilter: { field: { fieldPath: 'due' }, op: 'LESS_THAN_OR_EQUAL', value: { stringValue: new Date().toISOString() } } }, limit: 3 } })
+    });
+    const rows = await res.json().catch(() => []);
+    if (!res.ok || !Array.isArray(rows)) return;
+    let left = TG_SWEEP_MAX;
+    for (const r of rows) {
+      if (!r.document || left <= 0) continue;
+      const docId = r.document.name.split('/').pop();
+      const m = (decodeFields(r.document.fields || {}).m) || [];
+      const take = m.slice(0, left), rest = m.slice(left);
+      for (const key of take) {
+        const [chat, mid] = String(key).split(':');
+        await tgApi(env, 'deleteMessage', { chat_id: chat, message_id: Number(mid) }); // a refusal (already gone / too old) is fine
+        left--;
+      }
+      if (rest.length) await patchDoc(env, `tgSentLog/${docId}`, { m: rest }, ['m']);
+      else await deleteFirestoreDoc(env, `tgSentLog/${docId}`);
+    }
+  } catch (e) { console.error('sweepExpiredTgMessages failed', e && e.message); }
 }
 
 // Date/time shown in every viewer's own time zone (Bot API 9.5). Fallback text is Yangon time.
@@ -1952,6 +2025,8 @@ async function runCronSweepLocked(env) {
     await runCronSweep(env);
   } finally {
     await releaseCronLock(env);
+    await flushTgSent(env);
+    await sweepExpiredTgMessages(env);
   }
 }
 
