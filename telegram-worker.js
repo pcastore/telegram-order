@@ -1065,7 +1065,8 @@ function richWithButtons(rich, markup) {
   const rows = markup && Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard.filter(r => r && r.length) : [];
   if (!rich || !rows.length) return rich;
   const blocks = Array.isArray(rich.blocks) ? rich.blocks.slice() : [];
-  for (const row of rows) blocks.push({ type: 'buttons', align: 'center', buttons: row.slice(0, 8).map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b)) });
+  const even = padKeyboardEven(rows.map(row => row.slice(0, 8).map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b))));
+  for (const row of even) blocks.push({ type: 'buttons', align: 'center', buttons: row });
   return { ...rich, blocks };
 }
 
@@ -1428,39 +1429,38 @@ async function flushCostRows(env, state, budget) {
     await patchDoc(env, `costUpdates/${flushId}_${k}`, { items: items.slice(k * COST_DETAIL_CHUNK, (k + 1) * COST_DETAIL_CHUNK), createdAt: new Date().toISOString() }, ['items', 'createdAt']);
     budget.spend(1);
   }
-  const labelOf = (row, i) => {
-    if (typeof row === 'string' && row.startsWith('RICH1:')) {
-      try { const p = JSON.parse(row.slice(6)); if (p && p.name) return `🎮 ${p.name}${p.n ? ' (' + p.n + ')' : ''}`; } catch (e) { /* fall through */ }
-    }
-    return `🎮 Game ${i + 1}`;
-  };
-  const buttons = items.map((row, i) => ({ text: (() => { const t = labelOf(row, i); return t.length > 24 ? t.slice(0, 23) + '…' : t; })(), callback_data: `cost:${flushId}:${i}` }));
   const y = yangonNow();
   const hhmm = `${String(y.getUTCHours()).padStart(2, '0')}:${String(y.getUTCMinutes()).padStart(2, '0')}`;
   for (let m = 0; m < parts; m++) {
-    const slice = buttons.slice(m * COST_BUTTONS_PER_MSG, (m + 1) * COST_BUTTONS_PER_MSG);
-    const kb = [];
-    for (let i = 0; i < slice.length; i += 2) kb.push(slice.slice(i, i + 2));
-    // Odd leftover: pad with an inert "·" button so the last row is the same width as the others.
-    if (kb.length > 1 && kb[kb.length - 1].length < 2) kb[kb.length - 1].push({ text: '·', callback_data: 'noop:x' });
-    const head = `💱 <b>Cost updated</b> (${hhmm}) — ${state.rowsPkgs} package(s) in ${state.rowsGames} game(s)` +
-      (parts > 1 ? ` · ${m + 1}/${parts}` : '') + '\n👇 Tap a game to see its table';
-    const r = await sendRichAlert(env, {
-      title: '💱 Cost updated',
-      rows: [
-        ['🕐 Time (Yangon)', hhmm],
-        ['📦 Packages', String(state.rowsPkgs)],
-        ['🎮 Games', String(state.rowsGames)],
-        ...(parts > 1 ? [['📄 Page', `${m + 1}/${parts}`]] : [])
-      ],
-      note: '👇 Tap a game to see its table',
-      html: head,
-      replyMarkup: { inline_keyboard: kb }
-    });
+    const page = costIndexPage(items, flushId, m, hhmm, state.rowsPkgs, state.rowsGames);
+    const r = await sendRichAlert(env, { title: page.title, rows: page.rows, note: page.note, html: page.html, replyMarkup: page.markup });
     budget.spend(1);
     if (!(r && r.ok)) { console.error('Cost update index message failed', JSON.stringify(r)); return false; }
   }
   return true;
+}
+
+// One page of the Cost Update index: summary table + one button per game (even 2-column grid, every
+// button the same width). Used for the first send and to restore the index when "Back" is tapped.
+function costRowLabel(row, i) {
+  if (typeof row === 'string' && row.startsWith('RICH1:')) {
+    try { const p = JSON.parse(row.slice(6)); if (p && p.name) return `${p.name}${p.n ? ' (' + p.n + ')' : ''}`; } catch (e) { /* fall through */ }
+  }
+  return `Game ${i + 1}`;
+}
+function costIndexPage(items, flushId, m, hhmm, pkgs, games) {
+  const parts = Math.ceil(items.length / COST_BUTTONS_PER_MSG);
+  const from = m * COST_BUTTONS_PER_MSG;
+  const slice = items.slice(from, from + COST_BUTTONS_PER_MSG).map((row, j) => ({ text: costRowLabel(row, from + j), callback_data: `cost:${flushId}:${from + j}`, style: 'primary' }));
+  const kb = evenButtonGrid(slice, 'noop:x', { cols: 2 });
+  const head = `💱 <b>Cost updated</b> (${hhmm}) — ${pkgs} package(s) in ${games} game(s)` + (parts > 1 ? ` · ${m + 1}/${parts}` : '') + '\n👇 Tap a game to see its table';
+  return {
+    title: '💱 Cost updated',
+    rows: [['🕐 Time (Yangon)', hhmm], ['📦 Packages', String(pkgs)], ['🎮 Games', String(games)], ...(parts > 1 ? [['📄 Page', `${m + 1}/${parts}`]] : [])],
+    note: '👇 Tap a game to see its table',
+    html: head,
+    markup: { inline_keyboard: kb },
+  };
 }
 
 async function runAutoCostUpdateSweep(env) {
@@ -1584,9 +1584,81 @@ function stripBtnEmoji(text) {
   const t = String(text || '').replace(BTN_EMOJI_RE, '').replace(/\s+/g, ' ').trim();
   return t || String(text || '');
 }
+// Equal-width inline buttons (same model as the customer bot / store: every button in a row gets the same
+// width and every row is stretched to the widest row, using invisible U+2800 filler).
+const BTN_FILL = '\u2800';
+const BTN_PX_PER_EM = 38.5;
+const BTN_PAD_PX = 110;
+const BTN_GAP_PX = 20;
+const BTN_MAX_ROW_PX = 940;
+const BTN_ICON_PX = 33;
+const BTN_FILL_EM = 0.73;
+const BTN_SPACE_EM = 0.278;
+const BTN_EM_ASCII = [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584];
+function btnEm(s) {
+  let w = 0;
+  for (const ch of Array.from(String(s || ''))) {
+    const c = ch.codePointAt(0);
+    if (ch === BTN_FILL) w += BTN_FILL_EM;
+    else if (c >= 32 && c <= 126) w += BTN_EM_ASCII[c - 32] / 1000;
+    else if (ch === '\u00b7') w += 0.333;
+    else if (ch === '\u2026' || ch === '\u2014') w += 1;
+    else if (/[\u102b-\u103e\u1056-\u1059\u105e-\u1060\u1062-\u1064\u1067-\u106d\u1071-\u1074\u1082-\u108d\u108f\u109a-\u109d]/.test(ch)) continue; // Burmese marks sit on the base letter
+    else w += 0.9;
+  }
+  return w;
+}
+const btnIconPx = (b) => (b && (b.url || b.web_app) ? BTN_ICON_PX : 0);
+const btnNaturalPx = (b) => BTN_PX_PER_EM * btnEm(b && b.text) + BTN_PAD_PX + btnIconPx(b);
+// Pads `text` with filler on both sides so its text width becomes about `targetEm`.
+function padToEm(text, targetEm) {
+  const gap = targetEm - btnEm(text);
+  if (gap < 0.25) return text;
+  let k = Math.floor(gap / BTN_FILL_EM);
+  const rem = gap - k * BTN_FILL_EM;
+  let m = Math.round(rem / BTN_SPACE_EM);
+  if (Math.abs(BTN_FILL_EM - rem) < Math.abs(rem - m * BTN_SPACE_EM)) { k += 1; m = 0; }
+  if (k === 0) { if (gap < BTN_FILL_EM / 2) return text; k = 1; m = 0; }
+  const a = Math.ceil(k / 2), b = k - a;
+  const sl = b ? Math.ceil(m / 2) : m, sr = m - sl; // spaces always sit between filler and text (edge spaces would be trimmed)
+  return BTN_FILL.repeat(a) + ' '.repeat(sl) + text + ' '.repeat(sr) + BTN_FILL.repeat(b);
+}
+// Whole keyboard: every button in a row gets the same width, and every row is stretched to the same total
+// width as the widest row, so the left and right edges line up (short and long names look the same).
+function padKeyboardEven(rows) {
+  rows = rows.filter((r) => Array.isArray(r) && r.length);
+  const rowMax = rows.map((r) => Math.max(...r.map(btnNaturalPx)));
+  const rowTotal = rows.map((r, i) => r.length * rowMax[i] + (r.length - 1) * BTN_GAP_PX);
+  const R = Math.min(Math.max(...rowTotal), BTN_MAX_ROW_PX);
+  return rows.map((r, i) => {
+    const per = Math.max(rowMax[i], (R - (r.length - 1) * BTN_GAP_PX) / r.length);
+    return r.map((b) => (b && typeof b.text === 'string' ? { ...b, text: padToEm(b.text, (per - BTN_PAD_PX - btnIconPx(b)) / BTN_PX_PER_EM) } : b));
+  });
+}
+// Grid of NAME buttons (no more picking by number): 3 / 2 / 1 per row depending on the longest name so a
+// row never gets wider than the screen, long names are cut with an ellipsis, the last row is padded with
+// inert "·" buttons, and every button gets the same width.
+function evenButtonGrid(btns, padCb, opts) {
+  const cut = (text, cap) => {
+    if (btnEm(text) <= cap) return text;
+    let out = '';
+    for (const ch of Array.from(text)) { if (btnEm(out + ch) > cap - 0.5) break; out += ch; }
+    return out + '…';
+  };
+  const longest = btns.reduce((m, b) => Math.max(m, btnEm(b.text)), 0);
+  const cols = opts && opts.cols ? opts.cols : longest <= 4.8 ? 3 : longest <= 9 ? 2 : 1; // opts.cols = fixed layout (same on every page)
+  const cap = cols === 3 ? 4.8 : cols === 2 ? 9 : 20;
+  let cells = btns.map((b) => ({ ...b, text: cut(String(b.text || ''), cap) }));
+  if (cols > 1) while (cells.length % cols) cells.push({ text: '·', callback_data: padCb || 'noop' });
+  const target = cells.reduce((m, b) => Math.max(m, btnEm(b.text)), 0);
+  cells = cells.map((b) => ({ ...b, text: padToEm(b.text, target) }));
+  const rows = [];
+  for (let i = 0; i < cells.length; i += cols) rows.push(cells.slice(i, i + cols));
+  return rows;
+}
 function cleanInlineMarkup(markup) {
   if (!markup || !Array.isArray(markup.inline_keyboard)) return markup;
-  return { ...markup, inline_keyboard: markup.inline_keyboard.map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b))) };
+  return { ...markup, inline_keyboard: padKeyboardEven(markup.inline_keyboard.map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b)))) };
 }
 // No emoji anywhere: human-visible text (message text, captions, button labels, rich blocks) is cleaned just
 // before it is sent. callback_data, URLs and ids are never touched.
@@ -1786,18 +1858,23 @@ function buildOrderRich(id, f, balanceInfo) {
     ['📦 Package', String(f.itemAmount || '') + qty + (f.packageTab ? ` · ${f.packageTab}` : '')],
     ['💵 Price', Number(f.price || 0).toLocaleString() + ' MMK'],
     ['🆔 Player ID', String(f.playerId || 'N/A')],
+    ORDER_STATUS_LABEL[f.status] ? ['📌 Status', ORDER_STATUS_LABEL[f.status]] : null,
+    ['🔖 Order ID', String(id)]
+  ].filter(Boolean);
+  // Collapsible "Details" (closed by default): the rest of the order info.
+  const more = [
     f.inGameName ? ['🏷️ In-Game Name', String(f.inGameName)] : null,
     f.serverId ? ['🌐 Server ID', String(f.serverId)] : null,
     ['💳 Payment', String(f.paymentMethod || 'N/A')],
     ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
-    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null,
-    ORDER_STATUS_LABEL[f.status] ? ['📌 Status', ORDER_STATUS_LABEL[f.status]] : null,
-    ['🔖 Order ID', String(id)]
+    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null
   ].filter(Boolean);
   const cell = (text, header) => ({ text: String(text), is_header: !!header, align: 'center', valign: 'middle' });
+  const kvTable = (rs) => ({ type: 'table', is_bordered: true, cells: rs.map(([k, v]) => [cell(k, true), cell(v, false)]) });
   const blocks = [
     { type: 'heading', size: 2, text: f.status && f.status !== 'Pending' ? '🛒 Order' : '🛒 New Order ✨' },
-    { type: 'table', is_bordered: true, cells: rows.map(([k, v]) => [cell(k, true), cell(v, false)]) }
+    kvTable(rows),
+    { type: 'details', summary: '📋 Details', is_open: false, blocks: [kvTable(more)] }
   ];
   if (balanceInfo) {
     blocks.push({ type: 'paragraph', text: balanceInfo.insufficient
@@ -1833,15 +1910,19 @@ function buildTopupRich(id, f) {
   const when = f.timestamp ? new Date(Date.parse(f.timestamp)).toLocaleString('en-GB', { timeZone: 'Asia/Yangon', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
   const rows = [
     ['💵 Amount', Number(f.amount || 0).toLocaleString() + ' MMK'],
-    ['💳 Payment', String(f.paymentMethod || 'N/A')],
-    ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
-    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null,
     TOPUP_STATUS_LABEL[f.status] ? ['📌 Status', TOPUP_STATUS_LABEL[f.status]] : null,
     ['🔖 Request ID', String(id)]
   ].filter(Boolean);
+  // Collapsible "Details" (closed by default).
+  const more = [
+    ['💳 Payment', String(f.paymentMethod || 'N/A')],
+    ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
+    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null
+  ].filter(Boolean);
   return { blocks: [
     { type: 'heading', size: 2, text: f.status && f.status !== 'Pending' ? '💰 Wallet Top Up' : '💰 Wallet Top Up Request' },
-    richKV(rows)
+    richKV(rows),
+    { type: 'details', summary: '📋 Details', is_open: false, blocks: [richKV(more)] }
   ] };
 }
 
@@ -3883,6 +3964,8 @@ async function handleTelegramWebhook(request, env, ctx) {
       if (action === 'confirm') await resolveOrder(env, targetId, 'Processing', cb, '⏳ <b>MOVED TO PROCESSING</b>');
       else if (action === 'reject') await resolveOrder(env, targetId, 'Fail', cb, '❌ <b>REJECTED</b>');
       else if (action === 'cost') await showCostDetail(env, targetId, cb);
+      else if (action === 'costback') await showCostIndex(env, targetId, cb);
+      else if (action === 'costclose') await closeCostMessage(env, cb);
       else if (action === 'health') {
         await answerCallback(env, cb.id, 'Checking…');
         const hm = cb.message || {};
@@ -3927,8 +4010,9 @@ async function handleTelegramWebhook(request, env, ctx) {
   return new Response('ok');
 }
 
-// Tapped a game button on the Cost Update index message: send that game's table (Cost, and Price
-// if it moved) as a native bordered table message. callback data = "<cycleId>_<index>" split on ':'.
+// Tapped a game button on the Cost Update index message: the SAME message turns into that game's
+// table (Cost, and Price if it moved) with Back / Close buttons - no new message is sent.
+// callback data = "<cycleId>:<index>".
 async function showCostDetail(env, data, cb) {
   const [cycleId, idxStr] = String(data).split(':');
   const i = Number(idxStr);
@@ -3938,7 +4022,60 @@ async function showCostDetail(env, data, cb) {
   if (!row) { await answerCallback(env, cb.id, 'This update is no longer available.', true); return; }
   await answerCallback(env, cb.id);
   const msg = cb.message || {};
-  await sendCostRow(env, row, msg.chat && msg.chat.id ? msg.chat.id : env.TELEGRAM_CHAT_ID, msg.message_thread_id);
+  const chatId = msg.chat && msg.chat.id ? msg.chat.id : env.TELEGRAM_CHAT_ID;
+  if (!msg.message_id) return sendCostRow(env, row, chatId, msg.message_thread_id); // nothing to edit - old behaviour
+  let p = null;
+  if (typeof row === 'string' && row.startsWith('RICH1:')) { try { p = JSON.parse(row.slice(6)); } catch (e) { p = null; } }
+  const markup = { inline_keyboard: [[
+    { text: '🔙 Back', callback_data: `costback:${cycleId}:${Math.floor(i / COST_BUTTONS_PER_MSG)}` },
+    { text: '✖️ Close', style: 'danger', callback_data: 'costclose:x' },
+  ]] };
+  const base = { chat_id: chatId, message_id: msg.message_id };
+  if (p && p.rich) {
+    let r = await tgApi(env, 'editMessageText', { ...base, rich_message: richWithButtons(p.rich, markup) });
+    if (r && r.ok === false && !/not modified/i.test(r.description || '')) r = await tgApi(env, 'editMessageText', { ...base, rich_message: p.rich, reply_markup: cleanInlineMarkup(markup) });
+    if (!r || r.ok !== false || /not modified/i.test(r.description || '')) return;
+  }
+  await tgApi(env, 'editMessageText', { ...base, parse_mode: 'HTML', text: (p && p.html) || String(row), reply_markup: cleanInlineMarkup(markup) });
+}
+
+// "Back" from a game's table: puts the Cost Update index page back into the same message.
+async function showCostIndex(env, data, cb) {
+  const [cycleId, mStr] = String(data).split(':');
+  const m = Number(mStr) || 0;
+  if (!/^\d+$/.test(cycleId || '')) { await answerCallback(env, cb.id, 'Unknown action.'); return; }
+  const items = [];
+  let createdAt = '';
+  for (let k = 0; k < 25; k++) {
+    const doc = await getDoc(env, `costUpdates/${cycleId}_${k}`);
+    if (!doc || !Array.isArray(doc.fields.items)) break;
+    if (!createdAt) createdAt = doc.fields.createdAt || '';
+    items.push(...doc.fields.items);
+  }
+  if (!items.length) { await answerCallback(env, cb.id, 'This update is no longer available.', true); return; }
+  await answerCallback(env, cb.id);
+  const msg = cb.message || {};
+  if (!msg.message_id) return;
+  const pkgs = items.reduce((n, row) => { try { return n + (Number(JSON.parse(String(row).slice(6)).n) || 0); } catch (e) { return n; } }, 0);
+  const ms = Date.parse(createdAt);
+  const y = new Date((Number.isFinite(ms) ? ms : Date.now()) + 6.5 * 3600 * 1000);
+  const hhmm = `${String(y.getUTCHours()).padStart(2, '0')}:${String(y.getUTCMinutes()).padStart(2, '0')}`;
+  const page = costIndexPage(items, cycleId, Math.min(m, Math.ceil(items.length / COST_BUTTONS_PER_MSG) - 1), hhmm, pkgs, items.length);
+  const blocks = [{ type: 'heading', size: 2, text: page.title }, richKV(page.rows, page.note)];
+  const base = { chat_id: msg.chat && msg.chat.id ? msg.chat.id : env.TELEGRAM_CHAT_ID, message_id: msg.message_id };
+  let r = await tgApi(env, 'editMessageText', { ...base, rich_message: richWithButtons({ blocks }, page.markup) });
+  if (r && r.ok === false && !/not modified/i.test(r.description || '')) r = await tgApi(env, 'editMessageText', { ...base, rich_message: { blocks }, reply_markup: cleanInlineMarkup(page.markup) });
+  if (r && r.ok === false && !/not modified/i.test(r.description || '')) await tgApi(env, 'editMessageText', { ...base, parse_mode: 'HTML', text: page.html, reply_markup: cleanInlineMarkup(page.markup) });
+}
+
+// "Close" on an opened cost table: removes the message.
+async function closeCostMessage(env, cb) {
+  await answerCallback(env, cb.id);
+  const msg = cb.message || {};
+  if (!msg.message_id) return;
+  const chatId = msg.chat && msg.chat.id ? msg.chat.id : env.TELEGRAM_CHAT_ID;
+  const r = await tgApi(env, 'deleteMessage', { chat_id: chatId, message_id: msg.message_id });
+  if (!(r && r.ok)) await tgApi(env, 'editMessageText', { chat_id: chatId, message_id: msg.message_id, text: '✖️ Closed', reply_markup: { inline_keyboard: [] } });
 }
 
 // Shows the resolved status as the card's button rather than burying it in
