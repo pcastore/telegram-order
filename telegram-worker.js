@@ -2694,7 +2694,8 @@ async function fulfillWalletOrders(env, onlyId) {
       }
 
       if (doc.fields.g2bulkGameCode && doc.fields.g2bulkCatalogueName) {
-        await fulfillG2BulkOrder(env, id, doc.fields, g2bulk);
+        const g2r = await fulfillG2BulkOrder(env, id, doc.fields, g2bulk);
+        if (g2r && g2r.partial && charge) charge = { ...charge, chargeAmount: g2r.chargeAmount, cost: g2r.cost };
       } else if (doc.fields.jcplaysProductId) {
         await fulfillJCPlaysOrder(env, id, doc.fields, jcplays);
       } else if (doc.fields.g2bulkVoucherProductId) {
@@ -3033,7 +3034,9 @@ async function verifyWalletPrice(env, f, maxAgeMs = 30000) {
   if (!best) return { ok: false, reason: 'This item is no longer available.' };
 
   // Voucher orders buy `quantity` codes in one call: total = unit price x quantity.
-  const qty = f.g2bulkVoucherProductId ? Math.max(1, Math.min(MAX_VOUCHER_QTY, parseInt(f.quantity, 10) || 1)) : 1;
+  const qty = f.g2bulkVoucherProductId ? Math.max(1, Math.min(MAX_VOUCHER_QTY, parseInt(f.quantity, 10) || 1))
+    : (f.g2bulkGameCode && f.g2bulkCatalogueName) ? Math.max(1, Math.min(MAX_GAME_QTY, parseInt(f.quantity, 10) || 1))
+    : 1;
   const expected = best.price * qty;
   if (price !== expected) return changed;
   return { ok: true, price, cost: best.cost * qty };
@@ -3339,6 +3342,69 @@ async function writeSubOrdersMerged(env, orderId, subOrders, buildFields) {
   return info;
 }
 
+// Some units of a multi-unit G2Bulk order were bought but a later unit kept failing. The wallet has not been
+// charged yet (provider first, wallet second), so: shrink the order to the units that really went through,
+// bill only those, keep it Processing so the normal status checks finish it, and tell the admin.
+async function settlePartialG2BulkOrder(env, orderId, fields, subOrders, quantity, reason, attempts) {
+  const placedSubs = subOrders.filter(sb => sb.g2bulkOrderId);
+  const placed = placedSubs.length;
+  const fullPrice = Number(fields.price) || 0;
+  const fullCost = Number(fields.cost) || 0;
+  const chargeAmount = Math.round(fullPrice * placed / quantity);
+  const cost = Math.round(fullCost * placed / quantity);
+  const done = placedSubs.filter(sb => sb.result).length;
+  await writeSubOrdersMerged(env, orderId, placedSubs, () => ({
+    quantity: placed,
+    price: chargeAmount,
+    cost,
+    requestedQuantity: quantity,
+    g2bulkSubOrders: placedSubs,
+    g2bulkSubOrdersTotal: placed,
+    g2bulkSubOrdersDone: done,
+    g2bulkOrderId: placedSubs[0].g2bulkOrderId || null,
+    g2bulkStatus: placedSubs[0].status || 'PENDING',
+    status: 'Processing',
+    statusNote: `Partial: ${placed} of ${quantity} units were delivered, the rest could not be placed. The customer is charged for ${placed} only.`,
+    walletFulfillAttempts: attempts
+  }));
+  try {
+    await sendRichAlert(env, {
+      title: '⚠️ Partial order',
+      rows: [['🔖 Order', String(orderId)], ['📦 Units placed', `${placed} / ${quantity}`], ['💵 Charged', Number(chargeAmount).toLocaleString() + ' MMK']],
+      note: reason,
+      html: `⚠️ <b>Partial order</b>\n\nOrder <code>${orderId}</code>: ${placed} of ${quantity} units were placed at G2Bulk, the rest failed (${String(reason).replace(/[<>&]/g, '')}).\nThe customer is charged ${Number(chargeAmount).toLocaleString()} MMK for the ${placed} delivered unit(s) only.`
+    });
+  } catch (e) { console.error('partial order alert failed', e); }
+  return { partial: true, chargeAmount, cost };
+}
+
+// G2Bulk docs: the game / voucher purchase endpoints do not promise to reject an order the balance cannot cover
+// (SMM `add` does answer "Insufficient balance"), and a 5-unit order is placed as 5 separate calls. So the LIVE G2Bulk
+// balance (getMe / action=balance, in USD) is checked BEFORE the first unit is placed: all units or none.
+// requiredMmk is the order price (MMK) for the units still to place - the same conservative figure the admin
+// Confirm button already uses (price >= cost). Unknown balance (API hiccup) = go ahead, the real call is the check.
+// Returns true when it is safe to place; false after it has recorded a retry (order stays Pending, nothing was bought).
+async function g2bulkBalanceGate(env, orderId, fields, g2bulk, requiredMmk, attempts) {
+  let info = null;
+  try { info = await buildBalanceInfo(g2bulk, requiredMmk); } catch (e) { return true; }
+  if (!info || !info.insufficient) return true;
+  const need = Math.round(Number(requiredMmk) || 0);
+  const have = Math.round(info.mmkEquivalent);
+  const msg = `G2Bulk balance too low: ${info.balanceUsd.toFixed(2)} USD (~${have.toLocaleString()} MMK), need ~${need.toLocaleString()} MMK. Nothing was placed.`;
+  if (attempts === 0) { // alert the admin once per order, not on every retry
+    try {
+      await sendRichAlert(env, {
+        title: '⚠️ G2Bulk balance too low',
+        rows: [['🔖 Order', String(orderId)], ['💰 Needed', `~${need.toLocaleString()} MMK`], ['🏦 G2Bulk', `${info.balanceUsd.toFixed(2)} USD (~${have.toLocaleString()} MMK)`]],
+        note: 'Order NOT placed (no partial buy). Top up G2Bulk - it retries automatically; the customer is not charged if it still fails.',
+        html: `⚠️ <b>G2Bulk balance too low</b>\n\nOrder <code>${orderId}</code> needs ~${need.toLocaleString()} MMK but G2Bulk has ${info.balanceUsd.toFixed(2)} USD (~${have.toLocaleString()} MMK).\nNothing was placed. Top up G2Bulk - the order retries automatically; the customer is not charged if it still fails.`
+      });
+    } catch (e) { console.error('g2bulk balance alert failed', e); }
+  }
+  await recordFulfillFailure(env, orderId, attempts, msg);
+  return false;
+}
+
 async function fulfillG2BulkOrder(env, orderId, fields, g2bulk) {
   if (!g2bulk.apiKey) return; // not configured yet - leave Pending for the admin to handle
   if (g2bulk.enabled === false) return; // explicitly turned off in the G2Bulk Settings modal
@@ -3355,6 +3421,10 @@ async function fulfillG2BulkOrder(env, orderId, fields, g2bulk) {
   const callbackUrl = g2bulk.webhookUrl
     ? `${g2bulk.webhookUrl}?secret=${encodeURIComponent(g2bulk.webhookSecret || '')}`
     : undefined;
+
+  // All units or none: make sure G2Bulk can pay for every unit that is still to be placed.
+  const unitsLeft = subOrders.filter(sb => !sb.g2bulkOrderId).length;
+  if (unitsLeft > 0 && !(await g2bulkBalanceGate(env, orderId, fields, g2bulk, (Number(fields.price) || 0) * unitsLeft / quantity, attempts))) return;
 
   // Create AND save every unit's idempotency key BEFORE any G2Bulk call. If the Worker is
   // killed right after G2Bulk accepts a unit, the retry then reuses the same key instead of
@@ -3399,12 +3469,19 @@ async function fulfillG2BulkOrder(env, orderId, fields, g2bulk) {
       // Persist whatever units DID get placed before this failure, so the
       // next retry (below) resumes instead of restarting from unit 1.
       await writeSubOrdersMerged(env, orderId, subOrders, () => ({ quantity, g2bulkSubOrders: subOrders }));
+      // Out of retries but some units are already bought at G2Bulk: settle for the units that really went
+      // through (the customer pays for those only) instead of failing the whole order for free.
+      if (attempts + 1 >= MAX_WALLET_FULFILL_ATTEMPTS && subOrders.some(sb => sb.g2bulkOrderId)) {
+        return await settlePartialG2BulkOrder(env, orderId, fields, subOrders, quantity, `G2Bulk (unit ${sub.index}/${quantity}): ${err.message}`, attempts + 1);
+      }
       await recordFulfillFailure(env, orderId, attempts, `G2Bulk (unit ${sub.index}/${quantity}): ${err.message}`);
       return;
     }
 
     sub.g2bulkOrderId = data.order_id ?? data.order?.order_id ?? null;
     sub.status = data.status || data.order?.status || 'PENDING';
+    // G2Bulk top-ups usually answer COMPLETED straight away - remember it so the order can finish without another status call.
+    if (String(sub.status).toUpperCase() === 'COMPLETED') sub.result = 'COMPLETED';
   }
 
   await writeSubOrdersMerged(env, orderId, subOrders, ({ done, terminal }) => {
@@ -3464,6 +3541,8 @@ async function fulfillG2BulkVoucherOrder(env, orderId, fields, g2bulk) {
       }
     }
   } catch (e) { console.error('voucher stock pre-check skipped', e && e.message); }
+
+  if (!(await g2bulkBalanceGate(env, orderId, fields, g2bulk, Number(fields.price) || 0, attempts))) return;
 
   const idempotencyKey = fields.g2bulkVoucherIdempotencyKey || crypto.randomUUID();
   if (!fields.g2bulkVoucherIdempotencyKey) {
@@ -3859,7 +3938,8 @@ async function checkG2BulkDirectOrderOnce(env, orderId, fields, g2bulk) {
       if (res.status === 429 || res.status >= 500) return 'BACKOFF';
       const data = await res.json().catch(() => ({}));
       const st = String((data.order && data.order.status) || data.status || '').toUpperCase();
-      results.push(st === 'COMPLETED' ? 'COMPLETED' : (st === 'FAILED' || st === 'REFUNDED') ? 'FAILED' : null);
+      const refunded = (data.order && data.order.is_refunded === true) || data.is_refunded === true; // docs: game order status has is_refunded
+      results.push(refunded ? 'FAILED' : st === 'COMPLETED' ? 'COMPLETED' : (st === 'FAILED' || st === 'REFUNDED') ? 'FAILED' : null);
     }
     if (results.every(r => r === 'COMPLETED')) {
       await patchDoc(env, `orders/${orderId}`, { status: 'Success', confirmedAt: new Date(), g2bulkStatus: 'COMPLETED', g2bulkSubOrdersDone: subs.length }, ['status', 'confirmedAt', 'g2bulkStatus', 'g2bulkSubOrdersDone']);
@@ -3894,11 +3974,13 @@ async function pollPendingG2BulkDirectOrders(env) {
 // Right after an admin taps Confirm: re-check the provider a few times over ~20 s so a fast order shows
 // Success within seconds instead of waiting for the next 1-minute cron tick. Stops as soon as the
 // order is Success/Fail; anything still running afterwards is picked up by the cron polls.
-async function burstCheckOrder(env, orderId) {
+async function burstCheckOrder(env, orderId, opts = {}) {
   const g2bulkDoc = await getDoc(env, 'settings/g2bulk');
   const g2bulk = (g2bulkDoc && g2bulkDoc.fields) || {};
   let fazercard = null;
-  for (const wait of [3000, 4000, 6000, 8000]) {
+  const waits = Array.isArray(opts.waits) && opts.waits.length ? opts.waits : [3000, 4000, 6000, 8000];
+  for (const wait of waits) {
+    if (opts.until && Date.now() + wait > opts.until) return; // out of time: the cron polls take over
     await new Promise(r => setTimeout(r, wait));
     const doc = await getDoc(env, `orders/${orderId}`);
     if (!doc || doc.fields.status !== 'Processing') return;
@@ -4259,7 +4341,7 @@ async function notifyOrderDm(env, orderId, fields, status) {
         game: fields.game || '', price: fields.price || 0,
         userName: resolvedCustomerLabel(fields), userId,
         inGameId: fields.playerId || '', serverId: fields.serverId || '',
-        packageName: fields.itemAmount || '',
+        packageName: (fields.itemAmount || '') + (Number(fields.quantity) > 1 ? ` ×${Number(fields.quantity)}` : ''),
       }),
     });
     if (!res.ok) console.error('notifyOrderDm failed', res.status, await res.text());
@@ -4814,6 +4896,7 @@ async function handleRegisterUser(request, env, ctx) {
 //      flags) are set here, and the doc is written with the service account.
 const CLEAN_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_VOUCHER_QTY = 10; // keep in sync with Store.html's MAX_VOUCHER_QTY
+const MAX_GAME_QTY = 5;     // G2Bulk game top-up: units placed one after another (the upstream endpoint has no quantity)
 
 function cleanStr(v, max) {
   return wStr(v).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/[<>`]/g, '').trim().slice(0, max); // no HTML / template characters in customer text
@@ -5070,6 +5153,8 @@ async function createOrderCore(env, ctx, auth) {
   pair('fazercardGiftCategoryId', 'fazercardGiftCardId');
   const voucherId = cleanStr(o.g2bulkVoucherProductId, 160);
   if (voucherId) f.g2bulkVoucherProductId = voucherId;
+  // G2Bulk game top-up: quantity 1..MAX_GAME_QTY. The Worker places the units one after another (fulfillG2BulkOrder).
+  if (f.g2bulkGameCode && f.g2bulkCatalogueName && !voucherId) f.quantity = (qty >= 1 && qty <= MAX_GAME_QTY) ? qty : 1;
 
   const loc = cleanLocation(o.location);
   if (loc) f.location = loc;
@@ -5178,11 +5263,18 @@ async function createOrderCore(env, ctx, auth) {
   // claim, and skipped if the sweep already moved the order past Pending (that status
   // change sends its own tracker update).
   ctx.waitUntil((async () => {
+    const t0 = Date.now();
     try {
       // Wallet orders: fulfil THIS order immediately - no waiting on the send lock the cron may be holding.
       if (f.paidFromWallet === true) await fulfillWalletOrders(env, orderId);
       else await runPingSweep(env, 'order');
     } catch (e) { console.error('post-create sweep failed', e); }
+    // G2Bulk top-ups finish in seconds: check right away (every 1-6 s) instead of waiting for the 1-minute cron.
+    // Bounded to ~27 s, the most a Worker may keep running after its response; the cron covers anything slower.
+    if (f.paidFromWallet === true) {
+      try { await burstCheckOrder(env, orderId, { waits: [1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000], until: t0 + 27000 }); }
+      catch (e) { console.error('post-create burst check failed', e); }
+    }
     try {
       const fresh = await getDoc(env, `orders/${orderId}`);
       if (fresh && fresh.fields.status === 'Pending') await notifyOrderDm(env, orderId, fresh.fields, 'Pending');
