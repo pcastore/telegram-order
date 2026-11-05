@@ -197,6 +197,12 @@ async function routeRequest(request, env, ctx, url) {
       }
     }
 
+    // Customer Telegram bot -> wallet purchase (server-to-server, shared-secret). See handleBotCreateOrder().
+    if (url.pathname === '/bot-create-order' && request.method === 'POST') {
+      try { return await handleBotCreateOrder(request, env, ctx); }
+      catch (err) { console.error('/bot-create-order failed', err); return corsJson({ ok: false, error: 'Server error' }, 500); }
+    }
+
     // Public catalogue mirror (gamesPublic) - admin panel calls this after every games edit.
     if (url.pathname === '/admin-sync-games') {
       if (request.method === 'OPTIONS') return corsPreflightAdmin();
@@ -1052,10 +1058,22 @@ async function buildHealthReport(env, errorsOnly) {
   return { html, blocks };
 }
 
+// Bot API 10.3: buttons INSIDE the message bubble (InputRichBlockButtons) instead of a keyboard hanging under it.
+// One "buttons" block = one row (1-8 buttons); the button fields are the same as an inline-keyboard button's.
+// Falls back to a normal reply_markup keyboard wherever Telegram refuses the rich message.
+function richWithButtons(rich, markup) {
+  const rows = markup && Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard.filter(r => r && r.length) : [];
+  if (!rich || !rows.length) return rich;
+  const blocks = Array.isArray(rich.blocks) ? rich.blocks.slice() : [];
+  for (const row of rows) blocks.push({ type: 'buttons', align: 'center', buttons: row.slice(0, 8).map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b)) });
+  return { ...rich, blocks };
+}
+
 async function sendHealthReport(env, chatId, threadId, errorsOnly) {
   const { html, blocks } = await buildHealthReport(env, errorsOnly);
   const to = { chat_id: chatId, message_thread_id: threadId };
-  const r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, reply_markup: HEALTH_KB });
+  let r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: richWithButtons({ blocks }, HEALTH_KB) });
+  if (!(r && r.ok)) r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, reply_markup: HEALTH_KB });
   if (r && r.ok) return;
   console.error('rich health report failed, using HTML', JSON.stringify(r));
   await tgApi(env, 'sendMessage', { ...to, parse_mode: 'HTML', text: html, reply_markup: HEALTH_KB });
@@ -1423,6 +1441,8 @@ async function flushCostRows(env, state, budget) {
     const slice = buttons.slice(m * COST_BUTTONS_PER_MSG, (m + 1) * COST_BUTTONS_PER_MSG);
     const kb = [];
     for (let i = 0; i < slice.length; i += 2) kb.push(slice.slice(i, i + 2));
+    // Odd leftover: pad with an inert "·" button so the last row is the same width as the others.
+    if (kb.length > 1 && kb[kb.length - 1].length < 2) kb[kb.length - 1].push({ text: '·', callback_data: 'noop:x' });
     const head = `💱 <b>Cost updated</b> (${hhmm}) — ${state.rowsPkgs} package(s) in ${state.rowsGames} game(s)` +
       (parts > 1 ? ` · ${m + 1}/${parts}` : '') + '\n👇 Tap a game to see its table';
     const r = await sendRichAlert(env, {
@@ -1558,7 +1578,34 @@ async function runAutoCostUpdateSweep(env) {
 
 
 
+// Inline-button labels are plain text (no emoji).
+const BTN_EMOJI_RE = /[\p{Extended_Pictographic}\p{Regional_Indicator}\u200d\ufe0e\ufe0f\u20e3]/gu;
+function stripBtnEmoji(text) {
+  const t = String(text || '').replace(BTN_EMOJI_RE, '').replace(/\s+/g, ' ').trim();
+  return t || String(text || '');
+}
+function cleanInlineMarkup(markup) {
+  if (!markup || !Array.isArray(markup.inline_keyboard)) return markup;
+  return { ...markup, inline_keyboard: markup.inline_keyboard.map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b))) };
+}
+// No emoji anywhere: human-visible text (message text, captions, button labels, rich blocks) is cleaned just
+// before it is sent. callback_data, URLs and ids are never touched.
+const EMOJI_RUN_RE = /[0-9#*]\ufe0f?\u20e3 ?|[\p{Extended_Pictographic}\p{Regional_Indicator}\u200d\ufe0e\ufe0f\u20e3]+ ?/gu;
+function stripEmojiText(s) { return String(s).replace(EMOJI_RUN_RE, ''); }
+const TG_TEXT_KEYS = new Set(['text', 'caption', 'summary', 'title', 'html', 'input_field_placeholder']);
+function stripEmojiDeep(v, inText) {
+  if (typeof v === 'string') return inText ? stripEmojiText(v) : v;
+  if (Array.isArray(v)) return v.map(x => stripEmojiDeep(x, inText));
+  if (v && typeof v === 'object' && !(v instanceof Date)) {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = stripEmojiDeep(v[k], TG_TEXT_KEYS.has(k));
+    return o;
+  }
+  return v;
+}
 async function tgApi(env, method, payload) {
+  if (payload && payload.reply_markup) payload = { ...payload, reply_markup: cleanInlineMarkup(payload.reply_markup) };
+  if (payload && typeof payload === 'object') payload = stripEmojiDeep(payload, false);
   const call = async (pl) => {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
       method: 'POST',
@@ -1667,7 +1714,8 @@ async function sendRichAlert(env, o) {
   const to = { chat_id: o.chatId || env.TELEGRAM_CHAT_ID, ...(o.threadId ? { message_thread_id: o.threadId } : {}) };
   const kb = o.replyMarkup ? { reply_markup: o.replyMarkup } : {};
   const blocks = [{ type: 'heading', size: 2, text: o.title }, o.table || richKV(o.rows, o.note)];
-  const r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, ...kb });
+  let r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: richWithButtons({ blocks }, o.replyMarkup) });
+  if (!(r && r.ok) && o.replyMarkup) r = await tgApi(env, 'sendRichMessage', { ...to, rich_message: { blocks }, ...kb });
   if (r && r.ok) return r;
   console.error('rich alert failed, using HTML', JSON.stringify(r));
   return tgApi(env, 'sendMessage', { ...to, parse_mode: 'HTML', text: o.html, ...kb });
@@ -2075,7 +2123,7 @@ async function sweepCollection(env, collectionId, buildMessage) {
         const pr = await tgApi(env, 'sendPhoto', { chat_id: env.TELEGRAM_CHAT_ID, photo, caption: `🧾 Receipt · ${d.id.slice(0, 8)}` });
         if (pr && pr.ok) receiptMsgId = pr.result.message_id;
       }
-      const richPayload = (withCopy) => ({ chat_id: env.TELEGRAM_CHAT_ID, rich_message: rich, reply_markup: kb(withCopy), ...(receiptMsgId ? { reply_parameters: { message_id: receiptMsgId, allow_sending_without_reply: true } } : {}) });
+      const richPayload = (withCopy) => ({ chat_id: env.TELEGRAM_CHAT_ID, rich_message: richWithButtons(rich, kb(withCopy)), ...(receiptMsgId ? { reply_parameters: { message_id: receiptMsgId, allow_sending_without_reply: true } } : {}) });
       let rr = await tgApi(env, 'sendRichMessage', richPayload(true));
       if (!(rr && rr.ok) && copyRow && copyRow.length && /button|markup|copy/i.test((rr && rr.description) || '')) rr = await tgApi(env, 'sendRichMessage', richPayload(false));
       if (rr && rr.ok) {
@@ -3829,6 +3877,7 @@ async function handleTelegramWebhook(request, env, ctx) {
     if (sep === -1) { await answerCallback(env, cb.id, 'Unknown action.'); return new Response('ok'); }
     const action = raw.slice(0, sep);
     const targetId = raw.slice(sep + 1);
+    if (action === 'noop') { await answerCallback(env, cb.id, ''); return new Response('ok'); }
 
     try {
       if (action === 'confirm') await resolveOrder(env, targetId, 'Processing', cb, '⏳ <b>MOVED TO PROCESSING</b>');
@@ -3925,7 +3974,8 @@ async function editResolvedMessage(env, id, fields, buildMessage, statusLine) {
   if (fields.telegramIsRich) {
     const built = buildMessage(id, fields);
     if (built.rich) {
-      let r = await tgApi(env, 'editMessageText', { ...base, rich_message: built.rich, reply_markup: markupFor(true) });
+      let r = await tgApi(env, 'editMessageText', { ...base, rich_message: richWithButtons(built.rich, markupFor(true)) });
+      if (r && r.ok === false && !/not modified/i.test(r.description || '')) r = await tgApi(env, 'editMessageText', { ...base, rich_message: richWithButtons(built.rich, markupFor(false)) });
       if (r && r.ok === false && !/not modified/i.test(r.description || '')) r = await tgApi(env, 'editMessageText', { ...base, rich_message: built.rich, reply_markup: markupFor(false) });
       // Could not re-render the table: at least make sure the buttons show the new state.
       if (r && r.ok === false && !/not modified/i.test(r.description || '')) {
@@ -4792,6 +4842,45 @@ async function writeAudit(env, action, targetType, targetId, actor, detail) {
 async function handleCreateOrder(request, env, ctx) {
   const auth = await authCustomerRequest(request, env, 'createOrder', 10, 300, true);
   if (auth.error) return auth.error;
+  return createOrderCore(env, ctx, auth);
+}
+
+// POST /bot-create-order - the customer Telegram bot (pcastore.js) buys with the customer's WALLET.
+// Server-to-server only: authenticated with the same shared secret the two Workers already use
+// (settings/adminBroadcast.secret or env.ADMIN_BROADCAST_SECRET). The bot says WHICH Telegram user is
+// buying; the account is looked up through telegramAccounts/tg_<id> (the same link the store login
+// writes), so a customer can only ever spend their own wallet. Everything after that - ID name check,
+// catalogue price re-check, pending-order cap, idempotency, wallet auto-fulfil - is the SAME code
+// path the website uses (createOrderCore), so the two can never drift apart.
+// Body: { secret, telegramId, clientRequestId, order: { ...same fields as /create-order } }
+async function handleBotCreateOrder(request, env, ctx) {
+  let body;
+  try { body = await request.json(); } catch (e) { return badRequest('Bad request'); }
+  const secretDoc = await getDoc(env, 'settings/adminBroadcast');
+  const secret = (secretDoc && secretDoc.fields.secret) || env.ADMIN_BROADCAST_SECRET || '';
+  if (!secret || !timingSafeEqualStr(wStr(body && body.secret), secret)) return corsJson({ ok: false, error: 'forbidden' }, 403);
+  const tgId = wStr(body.telegramId);
+  if (!/^\d{1,20}$/.test(tgId)) return badRequest('Bad request');
+  if (await rateLimitHit(env, 'botOrder', tgId, 10, 300, true)) return badRequest('Too many requests. Please try again in a few minutes.', 429);
+  const link = await getDoc(env, `telegramAccounts/tg_${tgId}`);
+  const guestId = link ? wStr(link.fields.guestId) : '';
+  if (!CLEAN_ID.test(guestId)) return badRequest('Account not found. Please log in first.', 404, 'NO_ACCOUNT');
+  const user = await getDoc(env, `users/${guestId}`);
+  if (!user) return badRequest('Account not found. Please log in first.', 404, 'NO_ACCOUNT');
+  if (user.fields.banned) return badRequest('Your account has been restricted. Contact support.', 403);
+  const o = body.order && typeof body.order === 'object' ? body.order : null;
+  if (!o) return badRequest('Bad request');
+  if ((Number(user.fields.walletBalance) || 0) < Number(o.price)) return badRequest('Insufficient wallet balance.', 400, 'INSUFFICIENT_BALANCE');
+  const clean = { ...o };
+  delete clean.paymentMethod; delete clean.receiptUrl; delete clean.transactionId; // wallet only
+  return createOrderCore(env, ctx, {
+    body: { order: clean, wallet: true, clientRequestId: body.clientRequestId },
+    payload: { sub: 'tg_' + tgId },
+    customer: { id: guestId, fields: user.fields }
+  });
+}
+
+async function createOrderCore(env, ctx, auth) {
   const { body, payload, customer } = auth;
   const o = body.order && typeof body.order === 'object' ? body.order : null;
   if (!o) return badRequest('Bad request');
