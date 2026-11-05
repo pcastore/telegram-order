@@ -1062,10 +1062,9 @@ async function buildHealthReport(env, errorsOnly) {
 // Bot API 10.3: buttons INSIDE the message bubble (InputRichBlockButtons) instead of a keyboard hanging under it.
 // One "buttons" block = one row (1-8 buttons); the button fields are the same as an inline-keyboard button's.
 // Falls back to a normal reply_markup keyboard wherever Telegram refuses the rich message.
-// Buttons now go out as a normal inline keyboard under the message: Telegram makes every row the same full
-// width and splits it equally, so single buttons (Back / Cancel) are exactly as wide as the pairs above them.
-// Set true to go back to buttons drawn inside the bubble (padded with filler).
-const BUTTONS_IN_BUBBLE = false;
+// Buttons are drawn INSIDE the message bubble. Telegram sizes them by their text only, so every row is padded
+// (padKeyboardEven) to one common width and all rows share the same left / right edge.
+const BUTTONS_IN_BUBBLE = true;
 function richWithButtons(rich, markup) {
   if (!BUTTONS_IN_BUBBLE) return rich ? { ...rich, __kb: markup } : rich; // tgApi() turns __kb into reply_markup
   const rows = markup && Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard.filter(r => r && r.length) : [];
@@ -1635,7 +1634,7 @@ function padKeyboardEven(rows) {
   rows = rows.filter((r) => Array.isArray(r) && r.length);
   const rowMax = rows.map((r) => Math.max(...r.map(btnNaturalPx)));
   const rowTotal = rows.map((r, i) => r.length * rowMax[i] + (r.length - 1) * BTN_GAP_PX);
-  const R = Math.min(Math.max(...rowTotal), BTN_MAX_ROW_PX);
+  const R = Math.max(...rowTotal); // never narrower than the widest natural row
   return rows.map((r, i) => {
     const per = Math.max(rowMax[i], (R - (r.length - 1) * BTN_GAP_PX) / r.length);
     return r.map((b) => (b && typeof b.text === 'string' ? { ...b, text: padToEm(b.text, (per - BTN_PAD_PX - btnIconPx(b)) / BTN_PX_PER_EM) } : b));
@@ -1664,11 +1663,9 @@ function evenButtonGrid(btns, padCb, opts) {
 }
 function cleanInlineMarkup(markup) {
   if (!markup || !Array.isArray(markup.inline_keyboard)) return markup;
-  if (!BUTTONS_IN_BUBBLE) { // equal-width rows are done by Telegram: just clean the labels, never pad
-    return { ...markup, inline_keyboard: markup.inline_keyboard.filter(r => Array.isArray(r) && r.length)
-      .map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text.replace(/\u2800/g, '')) } : b))) };
-  }
-  return { ...markup, inline_keyboard: padKeyboardEven(markup.inline_keyboard.map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text) } : b)))) };
+  // A reply_markup keyboard hangs under the message and Telegram makes its rows equal itself: only clean labels.
+  return { ...markup, inline_keyboard: markup.inline_keyboard.filter(r => Array.isArray(r) && r.length)
+    .map(row => row.map(b => (b && typeof b.text === 'string' ? { ...b, text: stripBtnEmoji(b.text.replace(/\u2800/g, '')) } : b))) };
 }
 // No emoji anywhere: human-visible text (message text, captions, button labels, rich blocks) is cleaned just
 // before it is sent. callback_data, URLs and ids are never touched.
