@@ -948,8 +948,8 @@ const COST_FLUSH_MAX_WAIT_MS = 3 * 60 * 1000;
 let _costCfgMemo = null;               // { at, cfg } - settings docs reused for 5 minutes inside one isolate
 
 // Same maths as admin.html's autoPriceForCost(): Cost + margin, always rounded UP (never down) to a tiered step:
-// Price under 10,000 -> next multiple of 10; 10,000 to 59,999 -> next multiple of 50; 60,000 and up -> next multiple of 100.
-function priceStepFor(raw) { return raw >= 60000 ? 100 : raw >= 10000 ? 50 : 10; }
+// Price under 10,000 -> next multiple of 50 (..10-40 -> ..50, ..60-90 -> ..00); 10,000 and up -> next multiple of 100.
+function priceStepFor(raw) { return raw >= 10000 ? 100 : 50; }
 function autoPriceForCost(cost, marginPct) {
   if (!cost || cost <= 0) return 0;
   marginPct = Math.max(0, Number(marginPct) || 0);   // never below cost
@@ -1869,7 +1869,7 @@ async function sendRichAlert(env, o) {
 // proportional, so the padding just added uneven gaps instead of real
 // alignment. An emoji per row plus a bold label reads at a glance instead.
 function buildFieldList(rows) {
-  return rows.map(([icon, label, value]) => `${icon} <b>${label}</b>  ${value}`).join('\n');
+  return rows.map(([icon, label, value]) => `${icon ? icon + ' ' : ''}<b>${label}</b>  ${value}`).join('\n');
 }
 
 // Prefer the name resolved by looking the order/topup's userId up in the
@@ -1882,6 +1882,12 @@ function resolvedCustomerLabel(f) {
     || 'Guest';
 }
 
+// Map link for the order's location (the customer's browser location sent with the order), or null.
+function orderMapUrl(f) {
+  const l = f && f.location;
+  if (!l || typeof l.lat !== 'number' || typeof l.lng !== 'number') return null;
+  return `https://maps.google.com/?q=${l.lat},${l.lng}`;
+}
 function buildOrderMessage(id, f, balanceInfo) {
   const rows = [
     ['🎮', 'Game', esc(f.game) + (f.serverRegion ? ` (${esc(f.serverRegion)})` : '')],
@@ -1892,7 +1898,8 @@ function buildOrderMessage(id, f, balanceInfo) {
     f.serverId ? ['🌐', 'Server ID', esc(f.serverId)] : null,
     ['💳', 'Payment', esc(f.paymentMethod || 'N/A')],
     ['👤', 'Customer', esc(resolvedCustomerLabel(f)) + (f.userPhone ? ' · ' + esc(f.userPhone) : '')],
-    f.timestamp && tgTime(f.timestamp) ? ['🕐', 'Time', tgTime(f.timestamp)] : null
+    f.timestamp && tgTime(f.timestamp) ? ['🕐', 'Time', tgTime(f.timestamp)] : null,
+    orderMapUrl(f) ? ['', 'Location', `<a href="${orderMapUrl(f)}">Open map</a>`] : null
   ].filter(Boolean);
   // Live balance snapshot (G2Bulk/voucher-linked orders only) - shown right
   // on the order card so the admin can judge fulfillability before tapping
@@ -1937,7 +1944,8 @@ function buildOrderRich(id, f, balanceInfo) {
     f.serverId ? ['🌐 Server ID', String(f.serverId)] : null,
     ['💳 Payment', String(f.paymentMethod || 'N/A')],
     ['👤 Customer', resolvedCustomerLabel(f) + (f.userPhone ? ' · ' + f.userPhone : '')],
-    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null
+    when && when !== 'Invalid Date' ? ['🕐 Time', when] : null,
+    orderMapUrl(f) ? ['Location', orderMapUrl(f)] : null
   ].filter(Boolean);
   const cell = (text, header) => ({ text: String(text), is_header: !!header, align: 'center', valign: 'middle' });
   const kvTable = (rs) => ({ type: 'table', is_bordered: true, cells: rs.map(([k, v]) => [cell(k, true), cell(v, false)]) });
@@ -4986,6 +4994,10 @@ function cleanLocation(v) {
     if (typeof x === 'number' && Number.isFinite(x)) out[k] = x;
     else if (typeof x === 'string') out[k] = x.slice(0, 100);
   }
+  // lat/lng must be real coordinates (rounded to ~1 m); anything out of range is dropped.
+  if ('lat' in out) { if (typeof out.lat === 'number' && Math.abs(out.lat) <= 90) out.lat = Math.round(out.lat * 1e5) / 1e5; else delete out.lat; }
+  if ('lng' in out) { if (typeof out.lng === 'number' && Math.abs(out.lng) <= 180) out.lng = Math.round(out.lng * 1e5) / 1e5; else delete out.lng; }
+  if (('lat' in out) !== ('lng' in out)) { delete out.lat; delete out.lng; }
   return Object.keys(out).length ? out : null;
 }
 function badRequest(msg, status = 400, code = '') {
