@@ -72,7 +72,7 @@
  * See SETUP.md alongside this file for the full step-by-step deploy guide.
  */
 
-const FIRESTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
+const FIRESTORE_SCOPE = 'https://www.googleapis.com/auth/datastore https://www.googleapis.com/auth/firebase.messaging';
 // JCPlays proxy URL: taken from settings/jcplays.proxyUrl (saved in the admin panel's JCPlays Settings),
 // or the JCPLAYS_PROXY_URL Worker variable. No hard-coded URL.
 function jcplaysProxyUrl(env, jcplays) {
@@ -107,6 +107,8 @@ let cachedToken = null; // module-scope cache, lives for the isolate's lifetime
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runCronSweepLocked(env));
+    ctx.waitUntil(runScheduledPushes(env));
+    if (new Date().getUTCMinutes() % 5 === 0) ctx.waitUntil(runCartReminders(env));
   },
 
   async fetch(request, env, ctx) {
@@ -140,8 +142,8 @@ function originList(fromEnv, fallback) {
 const STORE_ORIGINS = [
   'https://pcagamestoremm.vercel.app'
 ];
-const STORE_PATHS = new Set(['/ping', '/register-user', '/create-order', '/create-topup', '/update-profile', '/my-state', '/create-package-link', '/payment-methods']);
-const ADMIN_PATHS = new Set(['/admin-login-lookup', '/admin-sync-claims', '/admin-sync-games', '/cf-usage', '/firestore-usage', '/admin-backfill-google-email']);
+const STORE_PATHS = new Set(['/ping', '/register-user', '/create-order', '/create-topup', '/update-profile', '/register-push', '/cart-intent', '/my-state', '/create-package-link', '/payment-methods']);
+const ADMIN_PATHS = new Set(['/admin-login-lookup', '/admin-sync-claims', '/admin-sync-games', '/cf-usage', '/firestore-usage', '/admin-backfill-google-email', '/admin-push', '/admin-register-push', '/admin-push-history']);
 
 function applyOriginCors(res, origin, allowed) {
   const headers = new Headers(res.headers);
@@ -183,13 +185,15 @@ async function routeRequest(request, env, ctx, url) {
     // edits. The browser sends its Firebase ID token; the Worker verifies it, finds the
     // customer, validates the fields and writes with the service account. See
     // "Customer writes" near the bottom of this file.
-    if (url.pathname === '/create-order' || url.pathname === '/create-topup' || url.pathname === '/update-profile' || url.pathname === '/my-state') {
+    if (url.pathname === '/create-order' || url.pathname === '/create-topup' || url.pathname === '/update-profile' || url.pathname === '/register-push' || url.pathname === '/cart-intent' || url.pathname === '/my-state') {
       if (request.method === 'OPTIONS') return corsPreflight();
       if (request.method === 'POST') {
         try {
           if (url.pathname === '/create-order') return await handleCreateOrder(request, env, ctx);
           if (url.pathname === '/create-topup') return await handleCreateTopup(request, env, ctx);
           if (url.pathname === '/my-state') return await handleMyState(request, env);
+          if (url.pathname === '/register-push') return await handleRegisterPush(request, env);
+          if (url.pathname === '/cart-intent') return await handleCartIntent(request, env);
           return await handleUpdateProfile(request, env);
         } catch (err) {
           console.error(url.pathname + ' failed', err);
@@ -252,6 +256,16 @@ async function routeRequest(request, env, ctx, url) {
     // Replaces the storefront's live Firestore listener on settings/presence (every
     // admin heartbeat write was billed as one read per open storefront). See
     // handleAdminStatus() at the bottom of this file.
+    if (url.pathname === '/admin-push' || url.pathname === '/admin-register-push' || url.pathname === '/admin-push-history') {
+      if (request.method === 'OPTIONS') return corsPreflightAdmin();
+      if (request.method === 'POST') {
+        try {
+          if (url.pathname === '/admin-push-history') return await handleAdminPushHistory(request, env, url);
+          return url.pathname === '/admin-push' ? await handleAdminPush(request, env, url) : await handleAdminRegisterPush(request, env, url);
+        } catch (err) { console.error(url.pathname + ' failed', err); return corsJsonAdmin({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
     if (url.pathname === '/admin-status') {
       if (request.method === 'OPTIONS') return adminStatusPreflight();
       if (request.method === 'GET') {
@@ -590,6 +604,24 @@ function commitFailed(result) { return !result || !!result.error; }
 // card + the admin panel. notifyOrderStatus() is called after every order that this Worker
 // resolves to Success/Fail; notifyOrderDm() (below) de-duplicates by order status, so a
 // customer never gets the same message twice.
+// 3+ failed orders within 10 minutes -> one admin push (then quiet for 30 min). State lives in settings/failWatch.
+async function noteOrderFailure(env, orderId) {
+  try {
+    const now = Date.now();
+    const d = await getDoc(env, 'settings/failWatch');
+    const f = (d && d.fields) || {};
+    let times = (Array.isArray(f.times) ? f.times.map(Number) : []).filter(t => now - t < 10 * 60000);
+    times.push(now);
+    times = times.slice(-20);
+    let lastAlert = Number(f.lastAlert) || 0;
+    if (times.length >= 3 && now - lastAlert > 30 * 60000) {
+      lastAlert = now;
+      await sendPushToAdmins(env, { title: '🚨 Order fail များနေပါတယ်', body: `၁၀ မိနစ်အတွင်း ${times.length} ခု fail ဖြစ်ပါတယ်။ Provider ကို စစ်ပါ`, tag: 'fail-spike', url: '/?open=orders' });
+    }
+    await patchDoc(env, 'settings/failWatch', { times, lastAlert }, ['times', 'lastAlert']);
+  } catch (e) { console.error('fail watch error', e); }
+}
+
 async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null) {
   try {
     const orderDoc = preloadedOrderDoc || await getDoc(env, `orders/${orderId}`);
@@ -597,7 +629,14 @@ async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null)
     // The admin card in Telegram still says "Processing" after the Worker resolves the order -
     // flip it to Success / Failed right now (the cron reconcile below is only the safety net).
     try { await syncTelegramCard(env, orderId, { ...orderDoc.fields, status }); } catch (e) { console.error('card sync failed', orderId, e); }
+    if (status === 'Fail') await noteOrderFailure(env, orderId);
     if (!orderDoc.fields.userId) return;
+    try {
+      if (orderDoc.fields.pushSentStatus !== status) {
+        const sent = await sendPushToUser(env, orderDoc.fields.userId, buildOrderPush(orderId, orderDoc.fields, status));
+        if (sent) await patchDoc(env, `orders/${orderId}`, { pushSentStatus: status }, ['pushSentStatus']);
+      }
+    } catch (e) { console.error('order push failed', orderId, e); }
     await notifyOrderDm(env, orderId, orderDoc.fields, status);
   } catch (err) {
     console.error('notifyOrderStatus error', orderId, status, err);
@@ -2608,6 +2647,12 @@ async function checkDailySummarySchedule(env, force = false) {
   const dayOrders = await queryByTimestampRange(env, 'orders', startIso, endIso);
 
   await sendPeriodSummaryToTelegram(env, 'Daily Order Summary', yesterdayStr, dayOrders);
+  try {
+    const ok = dayOrders.filter(o => o.fields.status === 'Success');
+    const bad = dayOrders.filter(o => o.fields.status === 'Fail').length;
+    const total = ok.reduce((a, o) => a + (Number(o.fields.price) || 0), 0);
+    await sendPushToAdmins(env, { title: `📊 ${yesterdayStr} အနှစ်ချုပ်`, body: `Order ${dayOrders.length} ခု · Success ${ok.length} · Fail ${bad}\n${total.toLocaleString('en-US')} MMK`, tag: 'daily-summary', url: '/?open=orders' });
+  } catch (e) { console.error('daily summary push failed', e); }
   await patchDoc(env, 'settings/dailySummary', { lastRunDate: todayStr }, ['lastRunDate']);
 }
 
@@ -3480,6 +3525,7 @@ async function g2bulkBalanceGate(env, orderId, fields, g2bulk, requiredMmk, atte
         html: `⚠️ <b>G2Bulk balance too low</b>\n\nOrder <code>${orderId}</code> needs ~${need.toLocaleString()} MMK but G2Bulk has ${info.balanceUsd.toFixed(2)} USD (~${have.toLocaleString()} MMK).\nNothing was placed. Top up G2Bulk - the order retries automatically; the customer is not charged if it still fails.`
       });
     } catch (e) { console.error('g2bulk balance alert failed', e); }
+    try { await sendPushToAdmins(env, { title: '⚠️ G2Bulk balance နည်းနေပါပြီ', body: `${info.balanceUsd.toFixed(2)} USD (~${have.toLocaleString('en-US')} MMK) · လိုအပ်ငွေ ~${need.toLocaleString('en-US')} MMK`, tag: 'g2bulk-low', url: '/' }); } catch (e) { /* ignore */ }
   }
   await recordFulfillFailure(env, orderId, attempts, msg);
   return false;
@@ -4520,6 +4566,15 @@ async function resolveTopup(env, topupId, status, cb, statusLine) {
 // into). Best-effort: a failure here must never break the confirm/reject
 // flow the admin just completed, so every error is swallowed and logged.
 async function notifyTopupCustomer(env, doc, status) {
+  // Phone push first (independent of Telegram): wallet credited / request rejected.
+  try {
+    if ((status === 'Completed' || status === 'Rejected') && doc.fields.userId) {
+      const tid = String(doc.name || '').split('/').pop() || String(Date.now());
+      const bal = status === 'Completed' ? await walletBalanceOf(env, doc.fields.userId) : null;
+      await sendPushToUser(env, doc.fields.userId, buildTopupPush(doc.fields.amount || 0, status, tid, bal));
+      if (status === 'Completed') await checkLowWalletBalance(env, doc.fields.userId);
+    }
+  } catch (e) { console.error('topup push failed', e); }
   // Same lookup notifyOrderDm() uses for orders: the telegramId store.html
   // saved on users/{userId} when the customer logged in with Telegram. The
   // top-up doc's own telegramId (set by the bot's in-chat flow) wins if
@@ -5127,6 +5182,7 @@ function alertHighValue(env, ctx, kind, id, f) {
     ['💵 Amount', amount.toLocaleString() + ' MMK'],
     f.game ? ['🎮 Game', String(f.game)] : null
   ].filter(Boolean);
+  ctx.waitUntil(sendPushToAdmins(env, { title: `💎 High-value ${kind}`, body: `${amount.toLocaleString('en-US')} MMK` + (f.game ? ' · ' + f.game : ''), tag: `hv-${kind}-${id}`, url: kind === 'order' ? '/?open=orders' : '/?open=topups' }));
   ctx.waitUntil(sendRichAlert(env, { title: `💰 High-value ${kind}`, rows: hvRows, note: 'Check the receipt carefully before approving.', html: text }).catch(() => {}));
 }
 
@@ -5341,6 +5397,9 @@ async function createOrderCore(env, ctx, auth) {
   }
 
   alertHighValue(env, ctx, 'order', orderId, f);
+  ctx.waitUntil(pushAdminsNewOrder(env, orderId, f));
+  ctx.waitUntil(pushCustomerOrderReceived(env, orderId, f));
+  ctx.waitUntil(patchDoc(env, `users/${f.userId}`, { cartState: 'none' }, ['cartState']).catch(() => {})); // ordered: cancel the cart reminder
   // Telegram card / wallet auto-fulfil right away (the cron stays as the safety net).
   // After the sweep, DM the customer's live order tracker (status as buttons) if they
   // linked Telegram. Done AFTER the sweep so our tracker writes can't race the wallet
@@ -5358,6 +5417,7 @@ async function createOrderCore(env, ctx, auth) {
     if (f.paidFromWallet === true) {
       try { await burstCheckOrder(env, orderId, { waits: [1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000], until: t0 + 27000 }); }
       catch (e) { console.error('post-create burst check failed', e); }
+      await checkLowWalletBalance(env, f.userId);
     }
     try {
       const fresh = await getDoc(env, `orders/${orderId}`);
@@ -5617,11 +5677,429 @@ async function handleCreateTopup(request, env, ctx) {
   if (!topupId) return badRequest('Could not save the top up request. Please try again.', 500);
 
   alertHighValue(env, ctx, 'topup', topupId, { amount, userId: customer.id });
+  ctx.waitUntil(pushAdminsNewTopup(env, topupId, amount, cleanStr(customer.fields.name, 60) || customer.id));
   ctx.waitUntil(runPingSweep(env, 'topup'));
   return corsJson({ ok: true, topupId });
 }
 
 // Profile-type edits only. Money / ban / role / ID fields can never be set from here.
+// ---------------------------------------------------------------------------
+// Web push (FCM HTTP v1). Data-only messages: the app's service worker draws the
+// notification, so it shows under the installed app's own name/icon (not "Chrome").
+// Needs the service account to have the "Firebase Cloud Messaging API Admin" role
+// and the Firebase Cloud Messaging API enabled in Google Cloud.
+// ---------------------------------------------------------------------------
+async function sendFcm(env, token, p, userId, clearPath) {
+  const at = await getAccessToken(env);
+  const data = {};
+  for (const k of ['title', 'body', 'url', 'tag', 'image', 'group']) if (p[k]) data[k] = String(p[k]).slice(0, 400);
+  // Only same-site relative links may be opened from a notification tap.
+  if (data.url && !/^\/(?!\/)/.test(data.url)) delete data.url;
+  if (data.image && !/^https:\/\//.test(data.image)) delete data.image;
+  const res = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${at}` },
+    body: JSON.stringify({ message: { token, data, webpush: { headers: { Urgency: 'high', TTL: '86400' } } } })
+  });
+  if (res.ok) return true;
+  const txt = await res.text();
+  console.error('sendFcm failed', res.status, txt.slice(0, 300));
+  const clr = clearPath || (userId ? `users/${userId}` : '');
+  if (clr && (res.status === 404 || /UNREGISTERED/.test(txt))) await dropDeadToken(env, clr, token);
+  return false;
+}
+// Removes one dead device token (users/{id} keeps up to 5 in fcmTokens; fcmToken = the newest).
+async function dropDeadToken(env, path, token) {
+  try {
+    const d = await getDoc(env, path);
+    if (!d) return;
+    const arr = (Array.isArray(d.fields.fcmTokens) ? d.fields.fcmTokens : []).filter(t => t !== token);
+    const fields = { fcmTokens: arr };
+    const mask = ['fcmTokens'];
+    if (d.fields.fcmToken === token) { fields.fcmToken = arr.length ? arr[arr.length - 1] : ''; mask.push('fcmToken'); }
+    await patchDoc(env, path, fields, mask);
+  } catch (e) { /* ignore */ }
+}
+function userTokens(f) {
+  const out = new Set();
+  if (Array.isArray(f.fcmTokens)) for (const t of f.fcmTokens) if (typeof t === 'string' && t) out.add(t);
+  if (typeof f.fcmToken === 'string' && f.fcmToken) out.add(f.fcmToken);
+  return [...out];
+}
+// English customers (users/{id}.pushLang === 'en') get p.en's title/body when the push has one.
+function localizePush(p, f) {
+  return (f && f.pushLang === 'en' && p.en) ? { ...p, ...p.en } : p;
+}
+async function sendPushToUser(env, userId, p) {
+  try {
+    const u = await getDoc(env, `users/${userId}`);
+    if (!u) return false;
+    const toks = userTokens(u.fields);
+    if (!toks.length) return false;
+    const q = localizePush(p, u.fields);
+    const rs = await Promise.all(toks.map(t => sendFcm(env, t, q, userId).catch(() => false)));
+    return rs.some(Boolean);
+  } catch (e) { console.error('sendPushToUser error', e); return false; }
+}
+function buildOrderPush(orderId, f, status) {
+  const pkg = (f.itemAmount || '') + (Number(f.quantity) > 1 ? ` ×${Number(f.quantity)}` : '');
+  const line = [f.game, pkg].filter(Boolean).join(' · ');
+  const ok = status === 'Success';
+  return {
+    title: ok ? '✅ အော်ဒါ အောင်မြင်ပါပြီ' : '❌ အော်ဒါ မအောင်မြင်ပါ',
+    body: (line ? line + '\n' : '') + (ok ? 'ဝယ်ယူမှုအတွက် ကျေးဇူးတင်ပါတယ် 🎮' : 'အသေးစိတ်ကို App ထဲမှာ ကြည့်ပါ'),
+    tag: 'order-' + orderId,
+    url: '/?open=order&id=' + encodeURIComponent(orderId),
+    en: {
+      title: ok ? '✅ Order successful' : '❌ Order failed',
+      body: (line ? line + '\n' : '') + (ok ? 'Thank you for your purchase 🎮' : 'See the details in the app')
+    }
+  };
+}
+
+// POST { idToken, userId, token, lang?, old? } — token '' turns push off for the device whose token is `old`
+// (no `old` = every device). A customer keeps up to 5 devices.
+async function handleRegisterPush(request, env) {
+  const auth = await authCustomerRequest(request, env, 'registerPush', 30, 300);
+  if (auth.error) return auth.error;
+  const { body, customer } = auth;
+  const token = typeof body.token === 'string' ? body.token.trim() : '';
+  const old = typeof body.old === 'string' ? body.old.trim() : '';
+  const tokRe = /^[A-Za-z0-9:_\-.]{20,4096}$/;
+  if (token && !tokRe.test(token)) return badRequest('Invalid push token.', 400);
+  if (old && !tokRe.test(old)) return badRequest('Invalid push token.', 400);
+  const lang = body.lang === 'en' ? 'en' : 'my';
+  let arr = userTokens(customer.fields);
+  if (token) arr = arr.filter(t => t !== token).concat(token).slice(-5);
+  else if (old) arr = arr.filter(t => t !== old);
+  else arr = [];
+  const write = {
+    update: { name: docName(env, `users/${customer.id}`), fields: {
+      fcmToken: encodeValue(arr.length ? arr[arr.length - 1] : ''),
+      fcmTokens: encodeValue(arr),
+      pushLang: encodeValue(lang),
+      fcmUpdatedAt: encodeValue(new Date())
+    } },
+    updateMask: { fieldPaths: ['fcmToken', 'fcmTokens', 'pushLang', 'fcmUpdatedAt'] },
+    currentDocument: { exists: true }
+  };
+  const result = await commitWrites(env, [write]);
+  if (result && result.error) return badRequest('Could not save push settings.', 500);
+  return corsJson({ ok: true });
+}
+
+// POST { game, item } — the customer picked a package. If no order follows within ~30 min the cron sends one reminder.
+async function handleCartIntent(request, env) {
+  const auth = await authCustomerRequest(request, env, 'cartIntent', 20, 300);
+  if (auth.error) return auth.error;
+  const { body, customer } = auth;
+  if (!userTokens(customer.fields).length) return corsJson({ ok: true, skipped: true }); // can't push anyway
+  const write = {
+    update: { name: docName(env, `users/${customer.id}`), fields: {
+      cartState: encodeValue('waiting'),
+      cartAt: encodeValue(Date.now()),
+      cartGame: encodeValue(cleanStr(body.game, 80)),
+      cartItem: encodeValue(cleanStr(body.item, 80))
+    } },
+    updateMask: { fieldPaths: ['cartState', 'cartAt', 'cartGame', 'cartItem'] },
+    currentDocument: { exists: true }
+  };
+  const result = await commitWrites(env, [write]);
+  if (result && result.error) return badRequest('Could not save.', 500);
+  return corsJson({ ok: true });
+}
+
+// Cron (every 5 min): one reminder for carts left alone 30 min - 24 h; quiet hours 22:00-07:00 Yangon.
+async function runCartReminders(env) {
+  try {
+    const h = yangonNow().getUTCHours();
+    if (h >= 22 || h < 7) return;
+    const rows = await queryEqualString(env, 'users', 'cartState', 'waiting', 300);
+    const now = Date.now();
+    for (const r of rows) {
+      const f = r.fields || {};
+      const at = Number(f.cartAt) || 0;
+      if (now - at < 30 * 60000) continue;
+      const path = `users/${r.id}`;
+      if (now - at > 24 * 3600000) { await patchDoc(env, path, { cartState: 'none' }, ['cartState']).catch(() => {}); continue; }
+      await patchDoc(env, path, { cartState: 'sent' }, ['cartState']).catch(() => {}); // mark first: never double-send
+      const line = [f.cartGame, f.cartItem].filter(Boolean).join(' · ');
+      await sendPushToUser(env, r.id, {
+        title: '🛒 ဝယ်ဖို့ ကျန်နေပါသေးတယ်',
+        body: (line ? line + '\n' : '') + 'အော်ဒါ ပြီးအောင် ဆက်လုပ်လိုက်ပါ',
+        tag: 'cart-reminder', url: '/',
+        en: { title: '🛒 Still in your cart', body: (line ? line + '\n' : '') + 'Tap to finish your order' }
+      });
+    }
+  } catch (e) { console.error('runCartReminders error', e); }
+}
+
+// Wallet running low: one warning when the balance drops under LOW_WALLET_MMK (default 5,000); re-armed once it is topped up.
+async function checkLowWalletBalance(env, userId) {
+  try {
+    const low = Number(env.LOW_WALLET_MMK) || 5000;
+    const u = await getDoc(env, `users/${userId}`);
+    if (!u) return;
+    const bal = Number(u.fields.walletBalance) || 0;
+    if (bal < low) {
+      if (u.fields.lowBalPushed === true) return;
+      const sent = await sendPushToUser(env, userId, {
+        title: '⚠️ Wallet လက်ကျန် နည်းနေပါပြီ',
+        body: `လက်ကျန် ${bal.toLocaleString('en-US')} MMK ပဲ ကျန်ပါတော့တယ်\nငွေဖြည့်ရန် နှိပ်ပါ`,
+        tag: 'wallet-low', url: '/?open=wallet',
+        en: { title: '⚠️ Wallet balance is low', body: `Only ${bal.toLocaleString('en-US')} MMK left\nTap to top up` }
+      });
+      if (sent) await patchDoc(env, `users/${userId}`, { lowBalPushed: true }, ['lowBalPushed']);
+    } else if (u.fields.lowBalPushed === true) {
+      await patchDoc(env, `users/${userId}`, { lowBalPushed: false }, ['lowBalPushed']);
+    }
+  } catch (e) { console.error('low balance check failed', e); }
+}
+
+async function walletBalanceOf(env, userId) {
+  try {
+    const u = await getDoc(env, `users/${userId}`);
+    const b = u && Number(u.fields.walletBalance);
+    return Number.isFinite(b) ? b : null;
+  } catch (e) { return null; }
+}
+// Customer push right after ordering: confirms receipt and shows how many orders are still waiting.
+async function pushCustomerOrderReceived(env, orderId, f) {
+  try {
+    if (!f.userId) return;
+    const cur = await getDoc(env, `orders/${orderId}`);
+    if (!cur || (cur.fields.status !== 'Pending' && cur.fields.status !== 'Processing')) return; // already finished: its own push covers it
+    const n = await countPendingFor(env, 'orders', f.userId, 20);
+    const pkg = (f.itemAmount || '') + (Number(f.quantity) > 1 ? ` ×${Number(f.quantity)}` : '');
+    const line = [f.game, pkg].filter(Boolean).join(' · ');
+    await sendPushToUser(env, f.userId, {
+      title: '🧾 အော်ဒါ လက်ခံပြီးပါပြီ',
+      body: (line ? line + '\n' : '') + (n > 1 ? `စောင့်ဆိုင်းနေသော အော်ဒါ ${n} ခု` : 'စစ်ဆေးနေပါတယ်၊ ခဏစောင့်ပါ'),
+      tag: 'order-' + orderId, // the Success/Fail push later replaces this one
+      url: '/?open=order&id=' + encodeURIComponent(orderId),
+      en: { title: '🧾 Order received', body: (line ? line + '\n' : '') + (n > 1 ? `${n} orders waiting` : 'We are checking it - one moment') }
+    });
+  } catch (e) { console.error('order received push failed', e); }
+}
+
+function buildTopupPush(amount, status, id, balance) {
+  const ok = status === 'Completed';
+  return {
+    title: ok ? '💰 ငွေဖြည့်ခြင်း အောင်မြင်ပါပြီ' : '❌ ငွေဖြည့်ခြင်း မအောင်မြင်ပါ',
+    body: ok ? `${Number(amount).toLocaleString('en-US')} MMK ကို Wallet ထဲ ထည့်ပေးပြီးပါပြီ` + (Number.isFinite(balance) && balance !== null ? `\nလက်ကျန် ${Number(balance).toLocaleString('en-US')} MMK` : '') : 'အသေးစိတ်ကို App ထဲမှာ ကြည့်ပါ',
+    tag: 'topup-' + id,
+    url: '/?open=wallet',
+    en: {
+      title: ok ? '💰 Top-up successful' : '❌ Top-up failed',
+      body: ok ? `${Number(amount).toLocaleString('en-US')} MMK added to your wallet` + (Number.isFinite(balance) && balance !== null ? `\nBalance ${Number(balance).toLocaleString('en-US')} MMK` : '') : 'See the details in the app'
+    }
+  };
+}
+
+// Push to every admin device that turned alerts on (adminPushTokens/{adminUid}.fcmToken).
+async function sendPushToAdmins(env, p) {
+  try {
+    const rows = await queryAllDocs(env, 'adminPushTokens', 100);
+    const results = await Promise.all(rows.map(async (r) => {
+      const t = r.fields && r.fields.fcmToken;
+      if (!t || typeof t !== 'string') return false;
+      try { return await sendFcm(env, t, p, null, `adminPushTokens/${r.id}`); } catch (e) { return false; }
+    }));
+    return results.filter(Boolean).length;
+  } catch (e) { console.error('sendPushToAdmins error', e); return 0; }
+}
+async function pushAdminsNewOrder(env, orderId, f) {
+  const pkg = (f.itemAmount || '') + (Number(f.quantity) > 1 ? ` ×${Number(f.quantity)}` : '');
+  const line = [f.game, pkg].filter(Boolean).join(' · ');
+  let who = '';
+  try { who = resolvedCustomerLabel(f) || ''; } catch (e) { /* ignore */ }
+  await sendPushToAdmins(env, {
+    title: '🛒 New order',
+    body: `${line}${line ? ' · ' : ''}${Number(f.price || 0).toLocaleString('en-US')} MMK${who ? '\n' + who : ''}`,
+    tag: 'new-order-' + orderId,
+    group: 'new-order',
+    url: '/?open=orders'
+  });
+}
+async function pushAdminsNewTopup(env, topupId, amount, userName) {
+  await sendPushToAdmins(env, {
+    title: '💰 New top-up request',
+    body: `${Number(amount).toLocaleString('en-US')} MMK${userName ? ' · ' + userName : ''}`,
+    tag: 'new-topup-' + topupId,
+    group: 'new-topup',
+    url: '/?open=topups'
+  });
+}
+
+const PUSH_SAFE_ID = /^[A-Za-z0-9_\-]{1,128}$/;
+
+// POST (Bearer admin ID token). Modes:
+//  { kind:'order', orderId, status }        -> customer push for a Success/Fail order (de-duplicated)
+//  { kind:'topup', userId, amount, topupId? } -> customer push "wallet credited"
+//  { title, body, image?, userId? }          -> announcement (userId omitted = every opted-in customer)
+async function handleAdminPush(request, env, url) {
+  const who = await authorizeAdminSync(request, env, url);
+  if (!who) return corsJsonAdmin({ ok: false, error: 'Not authorized' }, 401);
+  let b; try { b = await request.json(); } catch (e) { return corsJsonAdmin({ ok: false, error: 'Bad JSON' }, 400); }
+  const kind = String(b.kind || '');
+
+  if (kind === 'order') {
+    const orderId = String(b.orderId || '').trim();
+    const status = String(b.status || '');
+    if (!PUSH_SAFE_ID.test(orderId) || (status !== 'Success' && status !== 'Fail')) return corsJsonAdmin({ ok: false, error: 'Bad order' }, 400);
+    const od = await getDoc(env, `orders/${orderId}`);
+    if (!od || !od.fields.userId) return corsJsonAdmin({ ok: true, sent: 0 });
+    if (od.fields.pushSentStatus === status) return corsJsonAdmin({ ok: true, sent: 0, duplicate: true });
+    const sent = await sendPushToUser(env, od.fields.userId, buildOrderPush(orderId, od.fields, status));
+    if (sent) await patchDoc(env, `orders/${orderId}`, { pushSentStatus: status }, ['pushSentStatus']);
+    return corsJsonAdmin({ ok: true, sent: sent ? 1 : 0 });
+  }
+
+  if (kind === 'topup') {
+    const topupId = String(b.topupId || '').trim();
+    if (PUSH_SAFE_ID.test(topupId)) {
+      // An existing top-up request: read it server-side (never trust amount/user from the browser).
+      const td = await getDoc(env, `walletTopups/${topupId}`);
+      if (!td || !td.fields.userId) return corsJsonAdmin({ ok: true, sent: 0 });
+      const st = b.status === 'Rejected' ? 'Rejected' : 'Completed';
+      if (td.fields.pushSentStatus === st) return corsJsonAdmin({ ok: true, sent: 0, duplicate: true });
+      const bal = st === 'Completed' ? await walletBalanceOf(env, td.fields.userId) : null;
+      const sent = await sendPushToUser(env, td.fields.userId, buildTopupPush(td.fields.amount || 0, st, topupId, bal));
+      if (sent) await patchDoc(env, `walletTopups/${topupId}`, { pushSentStatus: st }, ['pushSentStatus']);
+      if (st === 'Completed') await checkLowWalletBalance(env, td.fields.userId);
+      return corsJsonAdmin({ ok: true, sent: sent ? 1 : 0 });
+    }
+    // Manual admin credit (no request doc): userId + amount
+    const userId = String(b.userId || '').trim();
+    const amount = Math.round(Number(b.amount) || 0);
+    if (!PUSH_SAFE_ID.test(userId) || !(amount > 0)) return corsJsonAdmin({ ok: false, error: 'Bad top-up' }, 400);
+    const sent = await sendPushToUser(env, userId, buildTopupPush(amount, 'Completed', String(Date.now()), await walletBalanceOf(env, userId)));
+    await checkLowWalletBalance(env, userId);
+    return corsJsonAdmin({ ok: true, sent: sent ? 1 : 0 });
+  }
+
+  const ann = {
+    title: String(b.title || '').trim().slice(0, 80),
+    body: String(b.body || '').trim().slice(0, 200),
+    details: String(b.details || '').trim().slice(0, 2000),
+    image: String(b.image || '').trim(),
+    userId: b.userId ? String(b.userId) : '',
+    game: String(b.game || '').trim().slice(0, 80),          // optional: only customers who bought this game
+    titleEn: String(b.titleEn || '').trim().slice(0, 80),    // optional English version for customers using English
+    bodyEn: String(b.bodyEn || '').trim().slice(0, 200)
+  };
+  if (!ann.title) return corsJsonAdmin({ ok: false, error: 'Title required' }, 400);
+  if (b.sendAt) {
+    // Scheduled promo: stored now, sent by the 1-minute cron once due (at most 30 days ahead)
+    const at = Number(b.sendAt);
+    if (!Number.isFinite(at) || at < Date.now() + 30000 || at > Date.now() + 30 * 864e5) return corsJsonAdmin({ ok: false, error: 'Bad schedule time' }, 400);
+    if (ann.userId && !PUSH_SAFE_ID.test(ann.userId)) return corsJsonAdmin({ ok: false, error: 'Bad user' }, 400);
+    const made = await createDoc(env, 'scheduledPushes', { ...ann, sendAt: Math.round(at), status: 'Pending', createdAt: new Date() });
+    if (!made || !made.name) return corsJsonAdmin({ ok: false, error: 'Could not schedule' }, 500);
+    return corsJsonAdmin({ ok: true, scheduled: true, sendAt: Math.round(at) });
+  }
+  return corsJsonAdmin({ ok: true, sent: await broadcastAnnouncement(env, ann) });
+}
+
+async function broadcastAnnouncement(env, ann) {
+  const p = { title: '📢 ' + ann.title, body: ann.body, tag: 'admin-' + Date.now(), url: '/?open=notifications' };
+  if (ann.titleEn || ann.bodyEn) p.en = { title: '📢 ' + (ann.titleEn || ann.title), body: ann.bodyEn || ann.body };
+  if (ann.image && /^https:\/\/[^\s"'<>]{4,380}$/.test(ann.image)) p.image = ann.image;
+  let sent = 0, failed = 0;
+  if (ann.userId) {
+    if (await sendPushToUser(env, ann.userId, p)) sent = 1; else failed = 1;
+  } else {
+    const users = await queryAllDocs(env, 'users', 1000);
+    let allow = null;
+    if (ann.game) { // segment: customers who have ordered this game
+      const os = await queryEqualString(env, 'orders', 'game', ann.game, 2000);
+      allow = new Set(os.map(o => o.fields && o.fields.userId).filter(Boolean));
+    }
+    const targets = users.filter(u => u.fields && userTokens(u.fields).length && (!allow || allow.has(u.id)));
+    for (let i = 0; i < targets.length; i += 20) {
+      const part = await Promise.all(targets.slice(i, i + 20).map(async (u) => {
+        const q = localizePush(p, u.fields);
+        const rs = await Promise.all(userTokens(u.fields).map(t => sendFcm(env, t, q, u.id).catch(() => false)));
+        return rs.some(Boolean);
+      }));
+      sent += part.filter(Boolean).length;
+      failed += part.filter(x => !x).length;
+    }
+  }
+  try {
+    await createDoc(env, 'pushLog', { title: ann.title, audience: ann.userId ? 'user' : (ann.game ? 'game: ' + ann.game : 'all'), sent, failed, at: new Date() });
+  } catch (e) { /* log is best effort */ }
+  return sent;
+}
+
+// Latest docs of a collection, newest first by `field` (single-field order, no composite index needed).
+async function queryRecent(env, collectionId, field, n) {
+  const token = await getAccessToken(env);
+  const res = await fetch(`https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ structuredQuery: { from: [{ collectionId }], orderBy: [{ field: { fieldPath: field }, direction: 'DESCENDING' }], limit: n } })
+  });
+  const rows = await res.json();
+  if (!res.ok || !Array.isArray(rows)) return [];
+  return rows.filter(r => r.document).map(r => ({ id: r.document.name.split('/').pop(), fields: decodeFields(r.document.fields || {}) }));
+}
+
+// POST (Bearer admin ID token) -> { ok, sent:[...], scheduled:[...] }  (the browser cannot read these collections itself)
+async function handleAdminPushHistory(request, env, url) {
+  const who = await authorizeAdminSync(request, env, url);
+  if (!who) return corsJsonAdmin({ ok: false, error: 'Not authorized' }, 401);
+  const [log, sched] = await Promise.all([queryRecent(env, 'pushLog', 'at', 30), queryRecent(env, 'scheduledPushes', 'sendAt', 30)]);
+  return corsJsonAdmin({
+    ok: true,
+    sent: log.map(r => ({ title: r.fields.title || '', audience: r.fields.audience || '', sent: r.fields.sent || 0, failed: r.fields.failed || 0, at: r.fields.at || '' })),
+    scheduled: sched.map(r => ({ title: r.fields.title || '', status: r.fields.status || '', sendAt: Number(r.fields.sendAt) || 0, sentCount: r.fields.sentCount || 0, audience: r.fields.userId ? 'user' : (r.fields.game ? 'game: ' + r.fields.game : 'all') }))
+  });
+}
+
+// Cron: send scheduled promos that are due. Claimed (status -> Sending) before sending so two overlapping runs can't double-send.
+async function runScheduledPushes(env) {
+  try {
+    const rows = await queryEqualString(env, 'scheduledPushes', 'status', 'Pending', 50);
+    const now = Date.now();
+    for (const r of rows) {
+      const f = r.fields || {};
+      if (!(Number(f.sendAt) <= now)) continue;
+      const path = `scheduledPushes/${r.id}`;
+      const cur = await getDoc(env, path);
+      if (!cur || cur.fields.status !== 'Pending') continue;
+      const claim = await commitWrites(env, [{
+        update: { name: docName(env, path), fields: { status: { stringValue: 'Sending' } } },
+        updateMask: { fieldPaths: ['status'] },
+        currentDocument: { updateTime: cur.updateTime }
+      }]);
+      if (commitFailed(claim)) continue;
+      try {
+        // Same inbox entry the admin panel writes for an instant send
+        const inbox = { title: f.title || '', intro: f.body || '', details: f.details || f.body || '', timestamp: new Date() };
+        if (!f.game) await createDoc(env, f.userId ? `users/${f.userId}/inbox` : 'notifications', inbox); // a segmented promo is push-only (the public inbox would show it to everyone)
+        const sent = await broadcastAnnouncement(env, { title: f.title || '', body: f.body || '', image: f.image || '', userId: f.userId || '', game: f.game || '', titleEn: f.titleEn || '', bodyEn: f.bodyEn || '' });
+        await patchDoc(env, path, { status: 'Sent', sentCount: sent, sentAt: new Date() }, ['status', 'sentCount', 'sentAt']);
+      } catch (e) {
+        console.error('scheduled push failed', r.id, e);
+        await patchDoc(env, path, { status: 'Failed' }, ['status']).catch(() => {});
+      }
+    }
+  } catch (e) { console.error('runScheduledPushes error', e); }
+}
+
+// POST (Bearer admin ID token) { token } — remember this admin's device for new order / top-up alerts.
+// token '' turns alerts off for this admin.
+async function handleAdminRegisterPush(request, env, url) {
+  const who = await authorizeAdminSync(request, env, url);
+  if (!who || !who.uid) return corsJsonAdmin({ ok: false, error: 'Not authorized' }, 401);
+  let b; try { b = await request.json(); } catch (e) { return corsJsonAdmin({ ok: false, error: 'Bad JSON' }, 400); }
+  const token = typeof b.token === 'string' ? b.token.trim() : '';
+  if (token && !/^[A-Za-z0-9:_\-.]{20,4096}$/.test(token)) return corsJsonAdmin({ ok: false, error: 'Invalid token' }, 400);
+  await patchDoc(env, `adminPushTokens/${who.uid}`, { fcmToken: token, updatedAt: new Date() }, ['fcmToken', 'updatedAt']);
+  return corsJsonAdmin({ ok: true });
+}
+
 async function handleUpdateProfile(request, env) {
   const auth = await authCustomerRequest(request, env, 'updateProfile', 60, 300);
   if (auth.error) return auth.error;
